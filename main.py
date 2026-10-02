@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -3413,46 +3414,71 @@ def check_m1_bos(
     }
 
 
-def _find_m15_take_profit(
-    symbol,
-    direction
-):
-    df = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="15m",
-        count=200
-    )
+def calculate_take_profits(
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    df_m15: pd.DataFrame
+) -> dict:
+    direction = str(direction).strip().upper()
 
-    if df.empty or len(df) < 30:
-        return None
+    if direction not in ("HAUSSIER", "BAISSIER"):
+        raise ValueError("Direction invalide.")
 
-    pivots = detect_pivots(
-        df,
-        M15_PIVOT_LEFT,
-        M15_PIVOT_RIGHT
-    )
+    if df_m15 is None or df_m15.empty:
+        raise ValueError("Données M15 insuffisantes.")
 
-    closed_index = len(df) - 2
+    if not {"high", "low"}.issubset(df_m15.columns):
+        raise ValueError("Les colonnes 'high' et 'low' sont requises.")
+
+    entry_price = float(entry_price)
+    stop_loss = float(stop_loss)
+
+    if not math.isfinite(entry_price) or not math.isfinite(stop_loss):
+        raise ValueError("Prix invalides.")
+
+    high = pd.to_numeric(df_m15["high"], errors="coerce").dropna()
+    low = pd.to_numeric(df_m15["low"], errors="coerce").dropna()
+
+    if high.empty or low.empty:
+        raise ValueError("Données M15 high/low insuffisantes.")
 
     if direction == "HAUSSIER":
-        candidates = [
-            p for p in pivots
-            if p["type"] == "HIGH"
-            and p["index"] < closed_index
-        ]
+        if stop_loss >= entry_price:
+            raise ValueError("SL invalide pour une position HAUSSIER.")
+
+        risk = entry_price - stop_loss
+        tp1 = entry_price + risk
+        tp3 = float(high.max()) * (1.0 - 0.0002)
+        tp2 = (tp1 + tp3) / 2.0
+        reward = tp3 - entry_price
+        rr_tp3 = reward / risk
+
     else:
-        candidates = [
-            p for p in pivots
-            if p["type"] == "LOW"
-            and p["index"] < closed_index
-        ]
+        if stop_loss <= entry_price:
+            raise ValueError("SL invalide pour une position BAISSIER.")
 
-    if not candidates:
-        return None
+        risk = stop_loss - entry_price
+        tp1 = entry_price - risk
+        tp3 = float(low.min()) * (1.0 + 0.0002)
+        tp2 = (tp1 + tp3) / 2.0
+        reward = entry_price - tp3
+        rr_tp3 = reward / risk
 
-    return float(
-        candidates[-1]["price"]
-    )
+    if not all(math.isfinite(value) for value in (tp1, tp2, tp3, rr_tp3)):
+        raise ValueError("Niveaux TP invalides.")
+
+    if rr_tp3 < 3.0:
+        raise ValueError(
+            f"Trade annulé : RR TP3 = {rr_tp3:.2f}, inférieur au minimum 1:3."
+        )
+
+    return {
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "tp3": float(tp3),
+        "rr_tp3": float(rr_tp3),
+    }
 
 
 def _build_active_trade(
@@ -3463,38 +3489,38 @@ def _build_active_trade(
     symbol = opp["symbol"]
     direction = opp["direction"]
 
-    entry = float(
-        execution["entry_price"]
-    )
-    sl = float(
-        execution["sl"]
-    )
+    entry = float(execution["entry_price"])
+    sl = float(execution["sl"])
 
-    tp = _find_m15_take_profit(
+    df_m15 = fetch_biquote_ohlcv(
         symbol,
-        direction
+        timeframe="15m",
+        count=200
     )
 
-    if tp is None:
-        return None
-
-    if direction == "HAUSSIER":
-        risk = entry - sl
-        reward = tp - entry
-        trade_direction = "BUY"
-    else:
-        risk = sl - entry
-        reward = entry - tp
-        trade_direction = "SELL"
-
-    if risk <= 0 or reward <= 0:
+    if df_m15.empty or len(df_m15) < 30:
         logging.info(
-            f"[M1] {symbol} {direction}: "
-            f"TP M15 invalide pour l'entrée OB."
+            f"[M1] {symbol} {direction}: données M15 insuffisantes pour TP."
         )
         return None
 
-    rr = reward / risk
+    try:
+        tp_levels = calculate_take_profits(
+            direction=direction,
+            entry_price=entry,
+            stop_loss=sl,
+            df_m15=df_m15
+        )
+    except ValueError as exc:
+        logging.info(
+            f"[M1] {symbol} {direction}: trade invalidé — {exc}"
+        )
+        return None
+
+    if direction == "HAUSSIER":
+        trade_direction = "BUY"
+    else:
+        trade_direction = "SELL"
 
     trade_id = (
         f"TRADE_{trade_direction}_{symbol}_"
@@ -3509,26 +3535,21 @@ def _build_active_trade(
         "entry_price": entry,
         "initial_sl": sl,
         "current_sl": sl,
-        "tp1": tp,
-        "tp2": tp,
-        "tp3": tp,
-        "tp": tp,
-        "rr_theoretical": rr,
+        "tp1": tp_levels["tp1"],
+        "tp2": tp_levels["tp2"],
+        "tp3": tp_levels["tp3"],
+        "tp": tp_levels["tp3"],
+        "rr_theoretical": tp_levels["rr_tp3"],
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
         "status": "PENDING_LIMIT",
         "execution_type": "SIMULATED_LIMIT",
         "order_block": order_block,
-        "m15_trigger_price": float(
-            opp["trigger_price"]
-        ),
-        "m15_bos_price": float(
-            opp["m15_bos_price"]
-        ),
-        "m1_choch_level": opp.get(
-            "m1_choch_level"
-        ),
-        "m1_bos_level": execution.get(
-            "bos_level"
-        ),
+        "m15_trigger_price": float(opp["trigger_price"]),
+        "m15_bos_price": float(opp["m15_bos_price"]),
+        "m1_choch_level": opp.get("m1_choch_level"),
+        "m1_bos_level": execution.get("bos_level"),
         "candidate_id": candidate_id,
         "created_at": strategy_timestamp()
     }
@@ -3581,7 +3602,9 @@ def execute_m1_order(
 
     entry = float(trade["entry_price"])
     sl = float(trade["initial_sl"])
-    tp = float(trade["tp"])
+    tp1 = float(trade["tp1"])
+    tp2 = float(trade["tp2"])
+    tp3 = float(trade["tp3"])
     rr = float(trade["rr_theoretical"])
 
     direction_text = (
@@ -3598,8 +3621,10 @@ def execute_m1_order(
         f"Direction : {direction_text}\n"
         f"Entrée OB M1 : `{entry:.8f}`\n"
         f"SL : `{sl:.8f}`\n"
-        f"TP M15 : `{tp:.8f}`\n"
-        f"RR théorique : `1:{rr:.2f}`"
+        f"TP1 : `{tp1:.8f}`\n"
+        f"TP2 : `{tp2:.8f}`\n"
+        f"TP3 : `{tp3:.8f}`\n"
+        f"RR TP3 : `1:{rr:.2f}`"
     )
 
     if send_telegram_message(message):
@@ -4107,16 +4132,14 @@ def track_active_trades():
                     direction = trade["direction"]
                     entry = float(trade["entry_price"])
                     current_sl = float(trade["current_sl"])
-                    tp = float(
-                        trade.get(
-                            "tp",
-                            trade.get("tp1")
-                        )
-                    )
-                    status = trade.get(
-                        "status",
-                        "ACTIVE"
-                    )
+                    tp1 = float(trade.get("tp1", trade.get("tp")))
+                    tp2 = float(trade.get("tp2", tp1))
+                    tp3 = float(trade.get("tp3", trade.get("tp", tp2)))
+                    status = trade.get("status", "ACTIVE")
+
+                    tp1_hit = bool(trade.get("tp1_hit", False))
+                    tp2_hit = bool(trade.get("tp2_hit", False))
+                    tp3_hit = bool(trade.get("tp3_hit", False))
 
                     if status == "PENDING_LIMIT":
                         filled = (
@@ -4157,25 +4180,49 @@ def track_active_trades():
                                 trade_id
                             )
 
-                        elif current_price >= tp:
-                            record_trade_event(
-                                trade_id,
-                                "TP3_HIT",
-                                current_price
-                            )
-                            close_trade_in_history(
-                                trade_id,
-                                "TP3",
-                                current_price
-                            )
-                            send_telegram_message(
-                                f"🏆 *TP Atteint* sur {symbol} "
-                                f"à `{current_price:.8f}`.\n"
-                                f"Trade terminé."
-                            )
-                            trades_to_delete.append(
-                                trade_id
-                            )
+                        else:
+                            if not tp1_hit and current_price >= tp1:
+                                trade["tp1_hit"] = True
+                                record_trade_event(
+                                    trade_id,
+                                    "TP1_HIT",
+                                    current_price
+                                )
+                                send_telegram_message(
+                                    f"🎯 *TP1 atteint* — {symbol}\n"
+                                    f"Prix : `{current_price:.8f}`"
+                                )
+
+                            if not tp2_hit and current_price >= tp2:
+                                trade["tp2_hit"] = True
+                                record_trade_event(
+                                    trade_id,
+                                    "TP2_HIT",
+                                    current_price
+                                )
+                                send_telegram_message(
+                                    f"🎯 *TP2 atteint* — {symbol}\n"
+                                    f"Prix : `{current_price:.8f}`"
+                                )
+
+                            if not tp3_hit and current_price >= tp3:
+                                trade["tp3_hit"] = True
+                                record_trade_event(
+                                    trade_id,
+                                    "TP3_HIT",
+                                    current_price
+                                )
+                                close_trade_in_history(
+                                    trade_id,
+                                    "TP3",
+                                    current_price
+                                )
+                                send_telegram_message(
+                                    f"🏆 *TP3 atteint* — {symbol}\n"
+                                    f"Prix : `{current_price:.8f}`.\n"
+                                    f"Trade terminé."
+                                )
+                                trades_to_delete.append(trade_id)
 
                     else:
                         if current_price >= current_sl:
@@ -4194,25 +4241,49 @@ def track_active_trades():
                                 trade_id
                             )
 
-                        elif current_price <= tp:
-                            record_trade_event(
-                                trade_id,
-                                "TP3_HIT",
-                                current_price
-                            )
-                            close_trade_in_history(
-                                trade_id,
-                                "TP3",
-                                current_price
-                            )
-                            send_telegram_message(
-                                f"🏆 *TP Atteint* sur {symbol} "
-                                f"à `{current_price:.8f}`.\n"
-                                f"Trade terminé."
-                            )
-                            trades_to_delete.append(
-                                trade_id
-                            )
+                        else:
+                            if not tp1_hit and current_price <= tp1:
+                                trade["tp1_hit"] = True
+                                record_trade_event(
+                                    trade_id,
+                                    "TP1_HIT",
+                                    current_price
+                                )
+                                send_telegram_message(
+                                    f"🎯 *TP1 atteint* — {symbol}\n"
+                                    f"Prix : `{current_price:.8f}`"
+                                )
+
+                            if not tp2_hit and current_price <= tp2:
+                                trade["tp2_hit"] = True
+                                record_trade_event(
+                                    trade_id,
+                                    "TP2_HIT",
+                                    current_price
+                                )
+                                send_telegram_message(
+                                    f"🎯 *TP2 atteint* — {symbol}\n"
+                                    f"Prix : `{current_price:.8f}`"
+                                )
+
+                            if not tp3_hit and current_price <= tp3:
+                                trade["tp3_hit"] = True
+                                record_trade_event(
+                                    trade_id,
+                                    "TP3_HIT",
+                                    current_price
+                                )
+                                close_trade_in_history(
+                                    trade_id,
+                                    "TP3",
+                                    current_price
+                                )
+                                send_telegram_message(
+                                    f"🏆 *TP3 atteint* — {symbol}\n"
+                                    f"Prix : `{current_price:.8f}`.\n"
+                                    f"Trade terminé."
+                                )
+                                trades_to_delete.append(trade_id)
 
                 except Exception as e:
                     logging.error(
