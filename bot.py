@@ -2814,6 +2814,16 @@ def telegram_request(
             timeout=timeout,
         )
 
+        if response.status_code == 409:
+
+            logger.warning(
+                "Telegram %s HTTP 409 : %s",
+                method,
+                response.text[:500],
+            )
+
+            return None
+
         if response.status_code != 200:
 
             logger.warning(
@@ -2838,6 +2848,36 @@ def telegram_request(
             return None
 
         return data
+
+    except requests.exceptions.ReadTimeout:
+
+        if method == "getUpdates":
+
+            logger.info(
+                "Telegram getUpdates : aucun nouvel événement pendant le délai d'attente."
+            )
+
+            return {
+                "ok": True,
+                "result": [],
+            }
+
+        logger.warning(
+            "Telegram %s : délai d'attente dépassé.",
+            method,
+        )
+
+        return None
+
+    except requests.exceptions.ConnectionError as exc:
+
+        logger.warning(
+            "Telegram %s connexion : %s",
+            method,
+            exc,
+        )
+
+        return None
 
     except requests.RequestException as exc:
 
@@ -2885,6 +2925,9 @@ def telegram_answer_callback(
     text: str,
 ) -> None:
 
+    if not callback_id:
+        return
+
     telegram_request(
         "answerCallbackQuery",
         {
@@ -2898,13 +2941,19 @@ def telegram_answer_callback(
 
 def telegram_delete_webhook() -> None:
 
-    telegram_request(
+    result = telegram_request(
         "deleteWebhook",
         {
             "drop_pending_updates": False,
         },
         timeout=20,
     )
+
+    if result is not None:
+
+        logger.info(
+            "Webhook Telegram supprimé : polling prêt."
+        )
 
 
 # ============================================================
@@ -3486,6 +3535,75 @@ def admin_prices_text() -> str:
     return "\n".join(lines)
 
 
+def handle_start_command(
+    message: Dict[str, Any],
+) -> None:
+
+    user_id = (
+        message.get(
+            "from",
+            {},
+        ).get(
+            "id"
+        )
+    )
+
+    chat_id = (
+        message.get(
+            "chat",
+            {},
+        ).get(
+            "id"
+        )
+    )
+
+    if not chat_id:
+        return
+
+    # --------------------------------------------------------
+    # /start administrateur
+    # --------------------------------------------------------
+
+    if is_admin(user_id):
+
+        telegram_send_message(
+            str(chat_id),
+            (
+                "🤖 *NOVA MULTI-TIMEFRAME BOT*\n\n"
+                "🟢 Bot connecté et opérationnel.\n\n"
+                "🔐 *Panneau administrateur :*\n"
+                "Sélectionnez une action :"
+            ),
+            admin_keyboard(),
+        )
+
+        logger.info(
+            "Commande /start reçue par l'administrateur : %s",
+            user_id,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # /start utilisateur non administrateur
+    # --------------------------------------------------------
+
+    telegram_send_message(
+        str(chat_id),
+        (
+            "🤖 *NOVA MULTI-TIMEFRAME BOT*\n\n"
+            "Bienvenue.\n"
+            "Le bot est opérationnel.\n\n"
+            "⛔ Les fonctions administrateur sont réservées."
+        ),
+    )
+
+    logger.info(
+        "Commande /start reçue par un utilisateur : %s",
+        user_id,
+    )
+
+
 def handle_admin_command(
     message: Dict[str, Any],
 ) -> None:
@@ -3664,6 +3782,11 @@ def telegram_polling_loop() -> None:
 
     global telegram_offset
 
+    # --------------------------------------------------------
+    # Suppression du webhook avant le polling.
+    # Les mises à jour en attente sont conservées.
+    # --------------------------------------------------------
+
     telegram_delete_webhook()
 
     logger.info(
@@ -3671,6 +3794,7 @@ def telegram_polling_loop() -> None:
     )
 
     consecutive_errors = 0
+    consecutive_conflicts = 0
 
     while telegram_running:
 
@@ -3686,13 +3810,19 @@ def telegram_polling_loop() -> None:
                         "callback_query",
                     ],
                 },
-                timeout=35,
+                timeout=40,
             )
+
+            # ------------------------------------------------
+            # Une réponse None signifie une erreur HTTP,
+            # réseau ou conflit Telegram.
+            # ------------------------------------------------
 
             if result is None:
 
                 consecutive_errors += 1
 
+                # Repli progressif en cas d'erreur.
                 time.sleep(
                     min(
                         30,
@@ -3706,6 +3836,7 @@ def telegram_polling_loop() -> None:
                 continue
 
             consecutive_errors = 0
+            consecutive_conflicts = 0
 
             updates = result.get(
                 "result",
@@ -3714,16 +3845,22 @@ def telegram_polling_loop() -> None:
 
             for update in updates:
 
-                telegram_offset = (
-                    int(
-                        update[
-                            "update_id"
-                        ]
-                    )
-                    + 1
-                )
-
                 try:
+
+                    update_id = update.get(
+                        "update_id"
+                    )
+
+                    if update_id is not None:
+
+                        telegram_offset = (
+                            int(update_id)
+                            + 1
+                        )
+
+                    # ------------------------------------------------
+                    # MESSAGE
+                    # ------------------------------------------------
 
                     message = update.get(
                         "message"
@@ -3738,13 +3875,33 @@ def telegram_polling_loop() -> None:
                             )
                         ).strip()
 
-                        if text.startswith(
-                            "/admin"
-                        ):
+                        command = (
+                            text.split(
+                                "@",
+                                1,
+                            )[0]
+                            .split(
+                                " ",
+                                1,
+                            )[0]
+                            .lower()
+                        )
+
+                        if command == "/start":
+
+                            handle_start_command(
+                                message
+                            )
+
+                        elif command == "/admin":
 
                             handle_admin_command(
                                 message
                             )
+
+                    # ------------------------------------------------
+                    # CALLBACK
+                    # ------------------------------------------------
 
                     callback = update.get(
                         "callback_query"
