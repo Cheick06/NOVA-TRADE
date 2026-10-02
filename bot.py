@@ -3438,19 +3438,51 @@ def admin_keyboard() -> Dict[str, Any]:
                 {
                     "text": "📊 Statut Global",
                     "callback_data": "admin_status",
-                }
+                },
+                {
+                    "text": "💰 Prix Direct",
+                    "callback_data": "admin_prices",
+                },
             ],
             [
                 {
-                    "text": "📊 Voir Prix en Direct",
-                    "callback_data": "admin_prices",
-                }
+                    "text": "📋 Ordres Actifs",
+                    "callback_data": "admin_orders",
+                },
+                {
+                    "text": "👁️ Paires Surveillées",
+                    "callback_data": "admin_pairs",
+                },
+            ],
+            [
+                {
+                    "text": "⏱️ Cooldowns",
+                    "callback_data": "admin_cooldowns",
+                },
+                {
+                    "text": "📈 Statistiques",
+                    "callback_data": "admin_stats",
+                },
+            ],
+            [
+                {
+                    "text": "📡 Sources Données",
+                    "callback_data": "admin_sources",
+                },
+                {
+                    "text": "💾 Persistance",
+                    "callback_data": "admin_persistence",
+                },
             ],
             [
                 {
                     "text": "🔄 Forcer un Scan",
                     "callback_data": "admin_scan",
-                }
+                },
+                {
+                    "text": "🔃 Actualiser",
+                    "callback_data": "admin_refresh",
+                },
             ],
         ]
     }
@@ -3469,18 +3501,37 @@ def admin_status_text() -> str:
         last_scan = last_scan_at
         duration = last_scan_duration
 
+        prices_count = len(
+            last_prices
+        )
+
     uptime = (
         utc_now()
         - bot_started_at
     )
 
+    scan_state = (
+        "🔴 EN COURS"
+        if scan_in_progress
+        else "🟢 AU REPOS"
+    )
+
+    telegram_state = (
+        "🟢 ACTIF"
+        if telegram_running
+        else "🔴 ARRÊTÉ"
+    )
+
     return (
         "🟢 *STATUT GLOBAL*\n\n"
-        "État : `OPÉRATIONNEL`\n"
-        f"Uptime : `{str(uptime).split('.')[0]}`\n"
-        f"Scans : `{scans}`\n"
-        f"Signaux : `{signals}`\n"
+        f"État bot : `OPÉRATIONNEL`\n"
+        f"Telegram : `{telegram_state}`\n"
+        f"Scan actuel : `{scan_state}`\n"
+        f"Uptime : `{str(uptime).split('.')[0]}`\n\n"
+        f"Scans réalisés : `{scans}`\n"
+        f"Signaux envoyés : `{signals}`\n"
         f"Ordres LIMIT actifs : `{active_orders}`\n"
+        f"Prix disponibles : `{prices_count}/{len(SYMBOLS)}`\n\n"
         f"Dernier scan : `{iso_datetime(last_scan)}`\n"
         f"Durée dernier scan : `{duration:.2f}s`\n\n"
         "Timeframes : `M15 / M5 / M1`\n"
@@ -3494,15 +3545,448 @@ def admin_prices_text() -> str:
     with state_lock:
 
         snapshot = {
-            symbol: dict(
-                data
-            )
+            symbol: dict(data)
             for symbol, data
             in last_prices.items()
         }
 
     lines = [
-        "📊 *PRIX EN DIRECT*",
+        "💰 *PRIX EN DIRECT*",
+        "",
+    ]
+
+    for symbol in SYMBOLS:
+
+        item = snapshot.get(
+            symbol
+        )
+
+        if not item:
+
+            lines.extend(
+                [
+                    f"🔴 *{symbol}*",
+                    "Prix : `N/A`",
+                    "État : `Aucune donnée`",
+                    "",
+                ]
+            )
+
+            continue
+
+        updated_at = item.get(
+            "updated_at"
+        )
+
+        lines.extend(
+            [
+                f"🟢 *{symbol}*",
+                f"Prix : `{format_price(symbol, item.get('price'))}`",
+                f"M15 : `{format_price(symbol, item.get('m15_price'))}`",
+                f"M5 : `{format_price(symbol, item.get('m5_price'))}`",
+                f"M1 : `{format_price(symbol, item.get('m1_price'))}`",
+                f"Volume M1 : `{format_volume(item.get('m1_volume'))}`",
+                f"Source : `{item.get('source', 'N/A')}`",
+                f"Mise à jour : `{iso_datetime(updated_at) if isinstance(updated_at, datetime) else 'N/A'}`",
+                "",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def admin_orders_text() -> str:
+
+    with state_lock:
+
+        orders = {
+            symbol: dict(order)
+            for symbol, order
+            in pending_orders.items()
+        }
+
+    if not orders:
+
+        return (
+            "📋 *ORDRES ACTIFS*\n\n"
+            "Aucun ordre LIMIT actif actuellement."
+        )
+
+    lines = [
+        "📋 *ORDRES LIMIT ACTIFS*",
+        "",
+    ]
+
+    now = utc_now()
+
+    for symbol, order in orders.items():
+
+        entry = safe_float(
+            order.get("entry")
+        )
+
+        sl = safe_float(
+            order.get("sl")
+        )
+
+        tp1 = safe_float(
+            order.get("tp1")
+        )
+
+        tp2 = safe_float(
+            order.get("tp2")
+        )
+
+        created_at = order.get(
+            "created_at"
+        )
+
+        expires_at = order.get(
+            "expires_at"
+        )
+
+        if isinstance(
+            created_at,
+            str,
+        ):
+
+            try:
+                created_at = datetime.fromisoformat(
+                    created_at
+                )
+            except Exception:
+                created_at = None
+
+        if isinstance(
+            expires_at,
+            str,
+        ):
+
+            try:
+                expires_at = datetime.fromisoformat(
+                    expires_at
+                )
+            except Exception:
+                expires_at = None
+
+        if expires_at:
+
+            remaining = (
+                expires_at - now
+            ).total_seconds()
+
+            remaining = max(
+                0,
+                int(remaining),
+            )
+
+            minutes = remaining // 60
+            seconds = remaining % 60
+
+            remaining_text = (
+                f"{minutes}m {seconds}s"
+            )
+
+        else:
+
+            remaining_text = "N/A"
+
+        direction = order.get(
+            "order_type",
+            order.get(
+                "direction",
+                "N/A",
+            ),
+        )
+
+        triggered = (
+            "🟢 DÉCLENCHÉ"
+            if order.get("triggered")
+            else "🟡 EN ATTENTE"
+        )
+
+        breakeven = (
+            "🟢 ENVOYÉ"
+            if order.get("breakeven_sent")
+            else "⚪ NON"
+        )
+
+        lines.extend(
+            [
+                f"🔹 *{symbol}* — `{direction}`",
+                f"État : `{triggered}`",
+                f"Entrée : `{format_price(symbol, entry)}`",
+                f"SL : `{format_price(symbol, sl)}`",
+                f"TP1 : `{format_price(symbol, tp1)}`",
+                f"TP2 : `{format_price(symbol, tp2)}`",
+                f"Temps restant : `{remaining_text}`",
+                f"Breakeven : `{breakeven}`",
+                f"Créé : `{iso_datetime(created_at) if isinstance(created_at, datetime) else 'N/A'}`",
+                "",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def admin_pairs_text() -> str:
+
+    with state_lock:
+
+        snapshot = {
+            symbol: dict(data)
+            for symbol, data
+            in last_prices.items()
+        }
+
+        active = set(
+            pending_orders.keys()
+        )
+
+    lines = [
+        "👁️ *PARES SURVEILLÉES*",
+        "",
+        f"Nombre de paires : `{len(SYMBOLS)}`",
+        "",
+    ]
+
+    for symbol in SYMBOLS:
+
+        item = snapshot.get(
+            symbol
+        )
+
+        if item:
+
+            price = format_price(
+                symbol,
+                item.get("price"),
+            )
+
+            source = item.get(
+                "source",
+                "N/A",
+            )
+
+            updated_at = item.get(
+                "updated_at"
+            )
+
+            if isinstance(
+                updated_at,
+                datetime,
+            ):
+
+                age = (
+                    utc_now()
+                    - updated_at
+                ).total_seconds()
+
+                if age < 120:
+                    data_state = "🟢 À JOUR"
+
+                elif age < 300:
+                    data_state = "🟡 ANCIENNE"
+
+                else:
+                    data_state = "🔴 TRÈS ANCIENNE"
+
+            else:
+
+                data_state = "⚪ INCONNUE"
+
+        else:
+
+            price = "N/A"
+            source = "N/A"
+            data_state = "🔴 AUCUNE DONNÉE"
+
+        order_state = (
+            "📋 LIMIT ACTIVE"
+            if symbol in active
+            else "⚪ AUCUNE LIMIT"
+        )
+
+        lines.extend(
+            [
+                f"*{symbol}*",
+                f"Prix : `{price}`",
+                f"Source : `{source}`",
+                f"Données : `{data_state}`",
+                f"Ordre : `{order_state}`",
+                "",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def admin_cooldowns_text() -> str:
+
+    with state_lock:
+
+        cooldowns = dict(
+            cooldown_tracker
+        )
+
+    now = utc_now()
+
+    lines = [
+        "⏱️ *COOLDOWNS*",
+        "",
+        f"Durée configurée : `{SIGNAL_COOLDOWN_MINUTES} minutes`",
+        "",
+    ]
+
+    for symbol in SYMBOLS:
+
+        last_signal = cooldowns.get(
+            symbol
+        )
+
+        if not last_signal:
+
+            lines.append(
+                f"*{symbol}* : 🟢 Disponible"
+            )
+
+            continue
+
+        if isinstance(
+            last_signal,
+            str,
+        ):
+
+            try:
+                last_signal = datetime.fromisoformat(
+                    last_signal
+                )
+            except Exception:
+                last_signal = None
+
+        if not isinstance(
+            last_signal,
+            datetime,
+        ):
+
+            lines.append(
+                f"*{symbol}* : 🟢 Disponible"
+            )
+
+            continue
+
+        elapsed = (
+            now - last_signal
+        ).total_seconds()
+
+        remaining = (
+            SIGNAL_COOLDOWN_MINUTES * 60
+            - elapsed
+        )
+
+        if remaining <= 0:
+
+            lines.append(
+                f"*{symbol}* : 🟢 Disponible"
+            )
+
+        else:
+
+            minutes = int(
+                remaining // 60
+            )
+
+            seconds = int(
+                remaining % 60
+            )
+
+            lines.extend(
+                [
+                    f"*{symbol}* : 🔴 Cooldown",
+                    f"Dernier signal : `{iso_datetime(last_signal)}`",
+                    f"Temps restant : `{minutes}m {seconds}s`",
+                ]
+            )
+
+    return "\n".join(lines)
+
+
+def admin_stats_text() -> str:
+
+    with state_lock:
+
+        scans = total_scans
+        signals = total_signals
+        active_orders = len(
+            pending_orders
+        )
+        closed = len(
+            closed_setups
+        )
+
+        prices_available = len(
+            last_prices
+        )
+
+    if scans > 0:
+
+        signals_per_scan = (
+            signals / scans
+        )
+
+    else:
+
+        signals_per_scan = 0.0
+
+    uptime_seconds = (
+        utc_now()
+        - bot_started_at
+    ).total_seconds()
+
+    if uptime_seconds > 0:
+
+        scans_per_hour = (
+            scans
+            / (uptime_seconds / 3600)
+        )
+
+    else:
+
+        scans_per_hour = 0.0
+
+    return (
+        "📈 *STATISTIQUES DÉTAILLÉES*\n\n"
+        f"Scans totaux : `{scans}`\n"
+        f"Signaux envoyés : `{signals}`\n"
+        f"Ordres actifs : `{active_orders}`\n"
+        f"Configurations clôturées : `{closed}`\n"
+        f"Paires avec données : `{prices_available}/{len(SYMBOLS)}`\n\n"
+        f"Signaux / scan : `{signals_per_scan:.3f}`\n"
+        f"Scans / heure : `{scans_per_hour:.2f}`\n\n"
+        f"Cooldown : `{SIGNAL_COOLDOWN_MINUTES} min`\n"
+        f"Expiration LIMIT : `{PENDING_ORDER_TIMEOUT_MINUTES} min`\n"
+        f"BE : `RR 1:{BE_TRIGGER_RR:g}`\n"
+        f"TP1 : `RR 1:{TP1_RR:g}`\n"
+        f"TP2 : `RR 1:{TP2_RR:g}`"
+    )
+
+
+def admin_sources_text() -> str:
+
+    with state_lock:
+
+        snapshot = {
+            symbol: dict(data)
+            for symbol, data
+            in last_prices.items()
+        }
+
+    lines = [
+        "📡 *SOURCES DE DONNÉES*",
+        "",
+        "Priorité principale : `BIQUOTE`",
+        "Secours : `Yahoo`",
+        "Secours BTC supplémentaire : `CoinGecko`",
         "",
     ]
 
@@ -3515,24 +3999,154 @@ def admin_prices_text() -> str:
         if not item:
 
             lines.append(
-                f"*{symbol}* : `N/A`"
+                f"*{symbol}* : 🔴 Aucune donnée"
             )
 
             continue
 
-        lines.extend(
-            [
-                f"*{symbol}*",
-                f"M15 : `{format_price(symbol, item.get('m15_price'))}`",
-                f"M5 : `{format_price(symbol, item.get('m5_price'))}`",
-                f"M1 : `{format_price(symbol, item.get('m1_price'))}`",
-                f"Prix : `{format_price(symbol, item.get('price'))}`",
-                f"Source : `{item.get('source', 'N/A')}`",
-                "",
-            ]
+        source = item.get(
+            "source",
+            "N/A",
+        )
+
+        updated_at = item.get(
+            "updated_at"
+        )
+
+        if isinstance(
+            updated_at,
+            datetime,
+        ):
+
+            age = (
+                utc_now()
+                - updated_at
+            ).total_seconds()
+
+            if age < 120:
+
+                status = "🟢 ACTIVE"
+
+            elif age < 300:
+
+                status = "🟡 ANCIENNE"
+
+            else:
+
+                status = "🔴 ANCIENNE"
+
+        else:
+
+            status = "⚪ INCONNUE"
+
+        lines.append(
+            f"*{symbol}* : `{source}` — {status}"
+        )
+
+    if ALPHA_VANTAGE_API_KEY:
+
+        lines.append(
+            "Alpha Vantage : `CONFIGURÉ`"
+        )
+
+    else:
+
+        lines.append(
+            "Alpha Vantage : `NON CONFIGURÉ`"
+        )
+
+    if TWELVE_DATA_API_KEY:
+
+        lines.append(
+            "Twelve Data : `CONFIGURÉ`"
+        )
+
+    else:
+
+        lines.append(
+            "Twelve Data : `NON CONFIGURÉ`"
         )
 
     return "\n".join(lines)
+
+
+def admin_persistence_text() -> str:
+
+    exists = os.path.exists(
+        STATE_FILE
+    )
+
+    if exists:
+
+        try:
+
+            size = os.path.getsize(
+                STATE_FILE
+            )
+
+            modified = datetime.fromtimestamp(
+                os.path.getmtime(
+                    STATE_FILE
+                ),
+                tz=timezone.utc,
+            )
+
+            file_status = "🟢 DISPONIBLE"
+
+            file_size = (
+                f"{size:,} octets"
+            )
+
+            modified_text = iso_datetime(
+                modified
+            )
+
+        except Exception:
+
+            file_status = "🟡 ACCESSIBLE"
+            file_size = "N/A"
+            modified_text = "N/A"
+
+    else:
+
+        file_status = "🟡 PAS ENCORE CRÉÉ"
+        file_size = "0 octet"
+        modified_text = "N/A"
+
+    with state_lock:
+
+        cooldown_count = len(
+            cooldown_tracker
+        )
+
+        pending_count = len(
+            pending_orders
+        )
+
+        closed_count = len(
+            closed_setups
+        )
+
+    return (
+        "💾 *ÉTAT DE LA PERSISTANCE*\n\n"
+        f"Fichier : `{STATE_FILE}`\n"
+        f"État : `{file_status}`\n"
+        f"Taille : `{file_size}`\n"
+        f"Dernière modification : `{modified_text}`\n\n"
+        f"Cooldowns sauvegardés : `{cooldown_count}`\n"
+        f"Ordres LIMIT sauvegardés : `{pending_count}`\n"
+        f"Configurations clôturées : `{closed_count}`"
+    )
+
+
+def admin_refresh_text() -> str:
+
+    return (
+        "🔃 *PANNEAU ADMINISTRATEUR*\n\n"
+        "Les informations affichées correspondent "
+        "à l'état actuel du bot.\n\n"
+        "Choisissez une rubrique :"
+    )
 
 
 def handle_start_command(
@@ -3560,10 +4174,6 @@ def handle_start_command(
     if not chat_id:
         return
 
-    # --------------------------------------------------------
-    # /start administrateur
-    # --------------------------------------------------------
-
     if is_admin(user_id):
 
         telegram_send_message(
@@ -3571,8 +4181,8 @@ def handle_start_command(
             (
                 "🤖 *NOVA MULTI-TIMEFRAME BOT*\n\n"
                 "🟢 Bot connecté et opérationnel.\n\n"
-                "🔐 *Panneau administrateur :*\n"
-                "Sélectionnez une action :"
+                "🔐 *PANNEAU ADMINISTRATEUR*\n"
+                "Vous avez accès au suivi détaillé du bot :"
             ),
             admin_keyboard(),
         )
@@ -3583,10 +4193,6 @@ def handle_start_command(
         )
 
         return
-
-    # --------------------------------------------------------
-    # /start utilisateur non administrateur
-    # --------------------------------------------------------
 
     telegram_send_message(
         str(chat_id),
@@ -3646,10 +4252,7 @@ def handle_admin_command(
 
     telegram_send_message(
         str(chat_id),
-        (
-            "🔐 *PANNEAU ADMIN*\n\n"
-            "Sélectionnez une action :"
-        ),
+        admin_refresh_text(),
         admin_keyboard(),
     )
 
@@ -3739,6 +4342,96 @@ def handle_callback_query(
 
         return
 
+    if data == "admin_orders":
+
+        telegram_answer_callback(
+            callback_id,
+            "Ordres actualisés.",
+        )
+
+        telegram_send_message(
+            str(message_chat_id),
+            admin_orders_text(),
+            admin_keyboard(),
+        )
+
+        return
+
+    if data == "admin_pairs":
+
+        telegram_answer_callback(
+            callback_id,
+            "Marchés actualisés.",
+        )
+
+        telegram_send_message(
+            str(message_chat_id),
+            admin_pairs_text(),
+            admin_keyboard(),
+        )
+
+        return
+
+    if data == "admin_cooldowns":
+
+        telegram_answer_callback(
+            callback_id,
+            "Cooldowns actualisés.",
+        )
+
+        telegram_send_message(
+            str(message_chat_id),
+            admin_cooldowns_text(),
+            admin_keyboard(),
+        )
+
+        return
+
+    if data == "admin_stats":
+
+        telegram_answer_callback(
+            callback_id,
+            "Statistiques actualisées.",
+        )
+
+        telegram_send_message(
+            str(message_chat_id),
+            admin_stats_text(),
+            admin_keyboard(),
+        )
+
+        return
+
+    if data == "admin_sources":
+
+        telegram_answer_callback(
+            callback_id,
+            "Sources vérifiées.",
+        )
+
+        telegram_send_message(
+            str(message_chat_id),
+            admin_sources_text(),
+            admin_keyboard(),
+        )
+
+        return
+
+    if data == "admin_persistence":
+
+        telegram_answer_callback(
+            callback_id,
+            "Persistance vérifiée.",
+        )
+
+        telegram_send_message(
+            str(message_chat_id),
+            admin_persistence_text(),
+            admin_keyboard(),
+        )
+
+        return
+
     if data == "admin_scan":
 
         started = start_immediate_scan()
@@ -3752,7 +4445,9 @@ def handle_callback_query(
 
             text = (
                 "🔄 *SCAN FORCÉ LANCÉ*\n\n"
-                "Les quatre actifs sont en cours d'analyse."
+                "Les quatre actifs sont en cours d'analyse.\n\n"
+                "Utilisez `🔃 Actualiser` pour consulter "
+                "l'état du bot."
             )
 
         else:
@@ -3772,6 +4467,23 @@ def handle_callback_query(
             text,
             admin_keyboard(),
         )
+
+        return
+
+    if data == "admin_refresh":
+
+        telegram_answer_callback(
+            callback_id,
+            "Panneau actualisé.",
+        )
+
+        telegram_send_message(
+            str(message_chat_id),
+            admin_refresh_text(),
+            admin_keyboard(),
+        )
+
+        return
 
 
 # ============================================================
