@@ -3,7 +3,8 @@ import time
 import json
 import logging
 import threading
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -48,6 +49,38 @@ WEEKLY_REPORTS_FILE = "weekly_reports.json"
 
 # Opportunités M15 en attente de surveillance M5/M1
 OPPORTUNITIES_FILE = "pending_opportunities.json"
+
+# Paramètres de la stratégie SMC + Price Action
+M15_TRIGGER_PROXIMITY_PCT = float(
+    os.environ.get("M15_TRIGGER_PROXIMITY_PCT", "0.25")
+)
+M15_PIVOT_LEFT = int(
+    os.environ.get("M15_PIVOT_LEFT", "2")
+)
+M15_PIVOT_RIGHT = int(
+    os.environ.get("M15_PIVOT_RIGHT", "2")
+)
+M5_PIVOT_LEFT = int(
+    os.environ.get("M5_PIVOT_LEFT", "2")
+)
+M5_PIVOT_RIGHT = int(
+    os.environ.get("M5_PIVOT_RIGHT", "2")
+)
+M1_PIVOT_LEFT = int(
+    os.environ.get("M1_PIVOT_LEFT", "2")
+)
+M1_PIVOT_RIGHT = int(
+    os.environ.get("M1_PIVOT_RIGHT", "2")
+)
+OPPORTUNITY_EXPIRY_CANDLES = int(
+    os.environ.get("OPPORTUNITY_EXPIRY_CANDLES", "60")
+)
+SCAN_WORKERS = max(
+    1,
+    min(len(SYMBOLS), int(os.environ.get("SCAN_WORKERS", str(len(SYMBOLS)))))
+)
+JSON_LOCK = threading.RLock()
+MARKET_EXECUTION_LOCK = threading.RLock()
 
 # API BiQuote
 BIQUOTE_BASE_URL = "https://biquote.io/api"
@@ -1723,72 +1756,74 @@ def telegram_polling_loop():
 
 
 # ==========================================
-# PERSISTANCE JSON
+# PERSISTANCE JSON THREAD-SAFE
 # ==========================================
 
 def load_json(filename):
+    with JSON_LOCK:
+        if not os.path.exists(filename):
+            return {}
 
-    if not os.path.exists(filename):
+        try:
+            with open(
+                filename,
+                "r",
+                encoding="utf-8"
+            ) as f:
+                data = json.load(f)
+
+            if isinstance(data, dict):
+                return data
+
+            logging.warning(
+                f"Le fichier {filename} ne contient pas un objet JSON valide."
+            )
+
+        except Exception as e:
+            logging.error(
+                f"Impossible de charger {filename}: {e}"
+            )
 
         return {}
-
-    try:
-
-        with open(
-            filename,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            data = json.load(f)
-
-        if isinstance(
-            data,
-            dict
-        ):
-
-            return data
-
-        logging.warning(
-            f"Le fichier {filename} ne contient "
-            f"pas un objet JSON valide."
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"Impossible de charger {filename}: {e}"
-        )
-
-    return {}
 
 
 def save_json(
     filename,
     data
 ):
+    with JSON_LOCK:
+        temp_filename = f"{filename}.tmp"
 
-    try:
+        try:
+            with open(
+                temp_filename,
+                "w",
+                encoding="utf-8"
+            ) as f:
+                json.dump(
+                    data,
+                    f,
+                    indent=4,
+                    ensure_ascii=False
+                )
+                f.flush()
+                os.fsync(f.fileno())
 
-        with open(
-            filename,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                data,
-                f,
-                indent=4,
-                ensure_ascii=False
+            os.replace(
+                temp_filename,
+                filename
             )
 
-    except Exception as e:
+        except Exception as e:
+            logging.error(
+                f"Impossible de sauvegarder {filename}: {e}"
+            )
 
-        logging.error(
-            f"Impossible de sauvegarder "
-            f"{filename}: {e}"
-        )
+            try:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+            except OSError:
+                pass
 
 
 # ==========================================
@@ -2642,1460 +2677,1341 @@ def evaluate_market_filter(
 
 
 # ==========================================
-# CRÉATION D'UNE OPPORTUNITÉ M15
+# STRATÉGIE SMC + PRICE ACTION MULTI-TIMEFRAME
 # ==========================================
+
+def utc_datetime():
+    return datetime.now(timezone.utc)
+
+
+def strategy_timestamp(value=None):
+    if value is None:
+        value = utc_datetime()
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def detect_pivots(
+    df,
+    left=2,
+    right=2
+):
+    """
+    Détecte les pivots confirmés sans utiliser les bougies
+    situées après le pivot pour prendre une décision prématurée.
+
+    Un pivot high est le plus haut de sa fenêtre.
+    Un pivot low est le plus bas de sa fenêtre.
+    """
+
+    if df is None or df.empty:
+        return []
+
+    if len(df) < left + right + 3:
+        return []
+
+    highs = pd.to_numeric(df["high"], errors="coerce")
+    lows = pd.to_numeric(df["low"], errors="coerce")
+
+    pivots = []
+
+    for i in range(left, len(df) - right):
+        high_window = highs.iloc[i - left:i + right + 1]
+        low_window = lows.iloc[i - left:i + right + 1]
+
+        high_value = highs.iloc[i]
+        low_value = lows.iloc[i]
+
+        if pd.isna(high_value) or pd.isna(low_value):
+            continue
+
+        if high_value == high_window.max():
+            pivots.append({
+                "type": "HIGH",
+                "index": i,
+                "price": float(high_value),
+                "timestamp": str(df["timestamp"].iloc[i])
+            })
+
+        if low_value == low_window.min():
+            pivots.append({
+                "type": "LOW",
+                "index": i,
+                "price": float(low_value),
+                "timestamp": str(df["timestamp"].iloc[i])
+            })
+
+    return sorted(
+        pivots,
+        key=lambda item: item["index"]
+    )
+
+
+def _last_pivot_before(
+    pivots,
+    pivot_type,
+    before_index=None
+):
+    candidates = [
+        pivot
+        for pivot in pivots
+        if pivot["type"] == pivot_type
+        and (
+            before_index is None
+            or pivot["index"] < before_index
+        )
+    ]
+
+    return candidates[-1] if candidates else None
+
+
+def check_m15_structure(
+    df
+):
+    """
+    Détermine le dernier BOS M15 et la zone macro à surveiller.
+
+    HAUSSIER :
+        clôture M15 au-dessus du dernier sommet pivot.
+        trigger = dernier creux pivot avant le BOS.
+
+    BAISSIER :
+        clôture M15 sous le dernier creux pivot.
+        trigger = dernier sommet pivot avant le BOS.
+    """
+
+    if df is None or len(df) < 20:
+        return None
+
+    pivots = detect_pivots(
+        df,
+        M15_PIVOT_LEFT,
+        M15_PIVOT_RIGHT
+    )
+
+    if not pivots:
+        return None
+
+    closed_index = len(df) - 2
+    closed_candle = df.iloc[closed_index]
+    close_price = float(closed_candle["close"])
+
+    highs = [
+        pivot
+        for pivot in pivots
+        if pivot["type"] == "HIGH"
+        and pivot["index"] < closed_index
+    ]
+
+    lows = [
+        pivot
+        for pivot in pivots
+        if pivot["type"] == "LOW"
+        and pivot["index"] < closed_index
+    ]
+
+    if not highs or not lows:
+        return None
+
+    last_high = highs[-1]
+    last_low = lows[-1]
+
+    bullish_break = close_price > last_high["price"]
+    bearish_break = close_price < last_low["price"]
+
+    if bullish_break:
+        macro_low = _last_pivot_before(
+            pivots,
+            "LOW",
+            last_high["index"]
+        )
+
+        if macro_low is None:
+            macro_low = last_low
+
+        return {
+            "direction": "HAUSSIER",
+            "bos_price": last_high["price"],
+            "bos_timestamp": last_high["timestamp"],
+            "trigger_price": float(macro_low["price"]),
+            "trigger_type": "SUPPORT",
+            "trigger_timestamp": macro_low["timestamp"],
+            "closed_timestamp": str(
+                closed_candle["timestamp"]
+            )
+        }
+
+    if bearish_break:
+        macro_high = _last_pivot_before(
+            pivots,
+            "HIGH",
+            last_low["index"]
+        )
+
+        if macro_high is None:
+            macro_high = last_high
+
+        return {
+            "direction": "BAISSIER",
+            "bos_price": last_low["price"],
+            "bos_timestamp": last_low["timestamp"],
+            "trigger_price": float(macro_high["price"]),
+            "trigger_type": "RESISTANCE",
+            "trigger_timestamp": macro_high["timestamp"],
+            "closed_timestamp": str(
+                closed_candle["timestamp"]
+            )
+        }
+
+    return None
+
+
+def _price_is_near_level(
+    price,
+    level,
+    proximity_pct
+):
+    if price <= 0 or level <= 0:
+        return False
+
+    distance_pct = (
+        abs(price - level)
+        / level
+        * 100.0
+    )
+
+    return distance_pct <= proximity_pct
+
+
+def _opportunity_exists_for_m15_setup(
+    opportunities,
+    symbol,
+    direction,
+    trigger_price
+):
+    for opportunity in opportunities.values():
+        if (
+            opportunity.get("symbol") == symbol
+            and opportunity.get("direction") == direction
+            and opportunity.get("status") in {
+                "WAITING_M5_LIQUIDITY",
+                "WAITING_M1_CHOCH",
+                "WAITING_M1_BOS"
+            }
+        ):
+            try:
+                old_trigger = float(
+                    opportunity.get("trigger_price")
+                )
+                if (
+                    abs(old_trigger - trigger_price)
+                    <= max(
+                        abs(trigger_price) * 0.00001,
+                        1e-12
+                    )
+                ):
+                    return True
+            except (TypeError, ValueError):
+                continue
+
+    return False
+
 
 def create_pending_opportunity(
     symbol,
     direction,
-    pattern,
-    entry,
-    sl,
-    tp1,
-    tp2,
-    tp3,
-    filter_score,
-    indicators,
-    zone,
-    candle_id
+    trigger_price,
+    m15_structure
 ):
     """
-    Enregistre l'opportunité M15 pour qu'elle soit
-    ensuite surveillée par M5.
-
-    Cette étape remplace uniquement la création
-    immédiate du trade qui existait auparavant.
+    Crée exactement une opportunité M15 indépendante par actif/setup.
     """
 
-    opportunities = load_json(
-        OPPORTUNITIES_FILE
-    )
-
     candidate_id = (
-        f"OPP_{direction}_"
-        f"{symbol}_"
-        f"{int(time.time())}"
+        f"OPP_{direction}_{symbol}_"
+        f"{int(time.time() * 1000)}"
     )
 
-    opportunities[candidate_id] = {
+    opportunity = {
         "candidate_id": candidate_id,
         "symbol": symbol,
         "direction": direction,
-        "pattern": pattern,
-        "entry_price": entry,
-        "initial_sl": sl,
-        "current_sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "filter_score": filter_score,
-        "indicators": indicators,
-        "zone": zone,
-        "m15_candle_id": candle_id,
-        "created_at": datetime.utcnow().isoformat(),
-        "status": "M5_SURVEILLANCE"
+        "trigger_price": float(trigger_price),
+        "detected_at": strategy_timestamp(),
+        "status": "WAITING_M5_LIQUIDITY",
+        "m15_bos_price": float(
+            m15_structure["bos_price"]
+        ),
+        "m15_bos_timestamp": str(
+            m15_structure["bos_timestamp"]
+        ),
+        "trigger_type": m15_structure["trigger_type"],
+        "trigger_timestamp": str(
+            m15_structure["trigger_timestamp"]
+        ),
+        "m15_closed_timestamp": str(
+            m15_structure["closed_timestamp"]
+        ),
+        "stage_started_at": strategy_timestamp(),
+        "last_processed_m5_timestamp": None,
+        "last_processed_m1_timestamp": None,
+        "m1_choch_timestamp": None,
+        "m1_choch_level": None,
+        "m1_sl": None,
+        "m1_bos_timestamp": None,
+        "m1_bos_level": None,
+        "order_block": None,
+        "created_at": strategy_timestamp()
     }
 
-    save_json(
-        OPPORTUNITIES_FILE,
-        opportunities
-    )
+    with JSON_LOCK:
+        opportunities = load_json(
+            OPPORTUNITIES_FILE
+        )
+
+        if _opportunity_exists_for_m15_setup(
+            opportunities,
+            symbol,
+            direction,
+            trigger_price
+        ):
+            return None
+
+        opportunities[candidate_id] = opportunity
+
+        save_json(
+            OPPORTUNITIES_FILE,
+            opportunities
+        )
 
     logging.info(
-        f"Opportunité {direction} créée pour "
-        f"{symbol} : {candidate_id}. "
-        f"Surveillance M5 activée."
+        f"[M15] {symbol} {direction} | "
+        f"BOS={m15_structure['bos_price']:.8f} | "
+        f"Trigger={trigger_price:.8f} | "
+        f"status=WAITING_M5_LIQUIDITY"
     )
 
     return candidate_id
 
 
-# ==========================================
-# ANALYSE M15
-# ==========================================
-
 def scan_market_m15(
     symbol
 ):
-
-    logging.info(
-        f"Vérification des conditions "
-        f"de marché M15 pour {symbol}..."
-    )
+    """
+    Analyse M15 indépendante pour un seul symbole.
+    """
 
     try:
-
-        supports, resistances = (
-            get_h1_zones(symbol)
-        )
-
         df_m15 = fetch_biquote_ohlcv(
             symbol,
             timeframe="15m",
-            count=100
+            count=200
         )
 
-        if df_m15.empty:
-
+        if df_m15.empty or len(df_m15) < 30:
             logging.warning(
-                f"Aucune donnée M15 "
-                f"disponible pour {symbol}."
+                f"[M15] Données insuffisantes pour {symbol}."
             )
-
             return
 
-        if len(df_m15) < 50:
-
-            logging.warning(
-                f"Pas assez de données M15 "
-                f"pour les indicateurs de {symbol}."
-            )
-
-            return
-
-        df_m15 = calculate_indicators(
+        structure = check_m15_structure(
             df_m15
         )
 
-        market_filter = (
-            evaluate_market_filter(
-                df_m15
-            )
-        )
-
-        if market_filter is None:
-
-            logging.warning(
-                f"Contexte indicateurs incomplet "
-                f"pour {symbol}."
-            )
-
-            return
-
-        last_candle = (
-            df_m15.iloc[-2]
-        )
-
-        candle_timestamp = (
-            last_candle["timestamp"]
-        )
-
-        candle_id = (
-            f"{symbol}_M15_"
-            f"{candle_timestamp}"
-        )
-
-        processed_signals = load_json(
-            SIGNALS_FILE
-        )
-
-        if candle_id in processed_signals:
-
+        if structure is None:
             logging.info(
-                f"Bougie {candle_id} "
-                f"déjà traitée."
+                f"[M15] Aucun BOS exploitable pour {symbol}."
             )
-
             return
 
-        pattern = detect_patterns(
-            df_m15
+        current_price = float(
+            df_m15["close"].iloc[-1]
         )
 
-        if not pattern:
+        trigger_price = float(
+            structure["trigger_price"]
+        )
 
-            logging.info(
-                f"Aucun pattern M15 "
-                f"exploitable pour {symbol}."
-            )
-
+        if not _price_is_near_level(
+            current_price,
+            trigger_price,
+            M15_TRIGGER_PROXIMITY_PCT
+        ):
             return
 
-        # ======================================
-        # BUY
-        # ======================================
-
-        if pattern in [
-            "AVALEMENT_HAUSSIER",
-            "MARTEAU"
-        ]:
-
-            if market_filter[
-                "buy_score"
-            ] < 2:
-
-                logging.info(
-                    f"BUY écarté par le filtre "
-                    f"contextuel {symbol}: "
-                    f"{market_filter['buy_score']}/4."
-                )
-
-                return
-
-            for sup in supports:
-
-                if (
-                    float(
-                        last_candle["low"]
-                    )
-                    <= sup["high_band"]
-                    and
-                    float(
-                        last_candle["close"]
-                    )
-                    >= sup["low_band"]
-                ):
-
-                    entry = float(
-                        last_candle["close"]
-                    )
-
-                    sl = (
-                        sup["low_band"]
-                        - (
-                            entry
-                            * 0.001
-                        )
-                    )
-
-                    risk = (
-                        entry
-                        - sl
-                    )
-
-                    if risk <= 0:
-                        continue
-
-                    tp1 = (
-                        entry
-                        + risk
-                    )
-
-                    tp2 = (
-                        entry
-                        + (
-                            risk
-                            * 2
-                        )
-                    )
-
-                    tp3 = (
-                        entry
-                        + (
-                            risk
-                            * 3
-                        )
-                    )
-
-                    candidate_id = (
-                        create_pending_opportunity(
-                            symbol=symbol,
-                            direction="BUY",
-                            pattern=pattern,
-                            entry=entry,
-                            sl=sl,
-                            tp1=tp1,
-                            tp2=tp2,
-                            tp3=tp3,
-                            filter_score=(
-                                market_filter[
-                                    "buy_score"
-                                ]
-                            ),
-                            indicators={
-                                "ema20": (
-                                    market_filter[
-                                        "ema20"
-                                    ]
-                                ),
-                                "ema50": (
-                                    market_filter[
-                                        "ema50"
-                                    ]
-                                ),
-                                "rsi14": (
-                                    market_filter[
-                                        "rsi14"
-                                    ]
-                                ),
-                                "atr14": (
-                                    market_filter[
-                                        "atr14"
-                                    ]
-                                ),
-                                "adx14": (
-                                    market_filter[
-                                        "adx14"
-                                    ]
-                                )
-                            },
-                            zone=sup,
-                            candle_id=candle_id
-                        )
-                    )
-
-                    processed_signals[
-                        candle_id
-                    ] = True
-
-                    save_json(
-                        SIGNALS_FILE,
-                        processed_signals
-                    )
-
-                    logging.info(
-                        f"Opportunité BUY M15 créée : "
-                        f"{candidate_id}. "
-                        f"Le signal n'est pas encore envoyé."
-                    )
-
-                    break
-
-        # ======================================
-        # SELL
-        # ======================================
-
-        elif pattern in [
-            "AVALEMENT_BAISSIER",
-            "ETOILE_FILANTE"
-        ]:
-
-            if market_filter[
-                "sell_score"
-            ] < 2:
-
-                logging.info(
-                    f"SELL écarté par le filtre "
-                    f"contextuel {symbol}: "
-                    f"{market_filter['sell_score']}/4."
-                )
-
-                return
-
-            for res in resistances:
-
-                if (
-                    float(
-                        last_candle["high"]
-                    )
-                    >= res["low_band"]
-                    and
-                    float(
-                        last_candle["close"]
-                    )
-                    <= res["high_band"]
-                ):
-
-                    entry = float(
-                        last_candle["close"]
-                    )
-
-                    sl = (
-                        res["high_band"]
-                        + (
-                            entry
-                            * 0.001
-                        )
-                    )
-
-                    risk = (
-                        sl
-                        - entry
-                    )
-
-                    if risk <= 0:
-                        continue
-
-                    tp1 = (
-                        entry
-                        - risk
-                    )
-
-                    tp2 = (
-                        entry
-                        - (
-                            risk
-                            * 2
-                        )
-                    )
-
-                    tp3 = (
-                        entry
-                        - (
-                            risk
-                            * 3
-                        )
-                    )
-
-                    candidate_id = (
-                        create_pending_opportunity(
-                            symbol=symbol,
-                            direction="SELL",
-                            pattern=pattern,
-                            entry=entry,
-                            sl=sl,
-                            tp1=tp1,
-                            tp2=tp2,
-                            tp3=tp3,
-                            filter_score=(
-                                market_filter[
-                                    "sell_score"
-                                ]
-                            ),
-                            indicators={
-                                "ema20": (
-                                    market_filter[
-                                        "ema20"
-                                    ]
-                                ),
-                                "ema50": (
-                                    market_filter[
-                                        "ema50"
-                                    ]
-                                ),
-                                "rsi14": (
-                                    market_filter[
-                                        "rsi14"
-                                    ]
-                                ),
-                                "atr14": (
-                                    market_filter[
-                                        "atr14"
-                                    ]
-                                ),
-                                "adx14": (
-                                    market_filter[
-                                        "adx14"
-                                    ]
-                                )
-                            },
-                            zone=res,
-                            candle_id=candle_id
-                        )
-                    )
-
-                    processed_signals[
-                        candle_id
-                    ] = True
-
-                    save_json(
-                        SIGNALS_FILE,
-                        processed_signals
-                    )
-
-                    logging.info(
-                        f"Opportunité SELL M15 créée : "
-                        f"{candidate_id}. "
-                        f"Le signal n'est pas encore envoyé."
-                    )
-
-                    break
+        create_pending_opportunity(
+            symbol=symbol,
+            direction=structure["direction"],
+            trigger_price=trigger_price,
+            m15_structure=structure
+        )
 
     except Exception as e:
-
         logging.exception(
-            f"Erreur scan_market_m15 "
-            f"{symbol}: {e}"
+            f"[M15] Erreur scan {symbol}: {e}"
         )
 
 
-# ==========================================
-# CONFIRMATION M5
-# ==========================================
+def _last_closed_timestamp(
+    df
+):
+    if df is None or len(df) < 2:
+        return None
 
-def evaluate_m5_opportunity(
-    opportunity
+    return str(
+        df["timestamp"].iloc[-2]
+    )
+
+
+def _get_newest_closed_candle(
+    df,
+    last_timestamp
+):
+    if df is None or len(df) < 3:
+        return None
+
+    closed_df = df.iloc[:-1].copy()
+
+    if last_timestamp is None:
+        return closed_df.iloc[-1]
+
+    matches = closed_df[
+        closed_df["timestamp"].astype(str)
+        != str(last_timestamp)
+    ]
+
+    if matches.empty:
+        return None
+
+    return matches.iloc[-1]
+
+
+def check_m5_liquidity(
+    df,
+    opp
 ):
     """
-    Surveille une opportunité M15 avec M5.
+    Validation du Stop Hunt M5 sur la bougie M5 clôturée.
 
-    M5 ne recalcule pas la stratégie M15 :
-    il sert uniquement à surveiller le moment où
-    l'opportunité devient exploitable.
+    HAUSSIER :
+        low < trigger puis close > trigger.
 
-    Une bougie M5 clôturée dans le même sens que
-    l'opportunité constitue la confirmation M5.
+    BAISSIER :
+        high > trigger puis close < trigger.
     """
 
-    symbol = opportunity.get(
-        "symbol"
+    if df is None or len(df) < 5:
+        return False, None
+
+    trigger = float(
+        opp["trigger_price"]
+    )
+    direction = opp["direction"]
+
+    last_closed = df.iloc[-2]
+
+    candle_timestamp = str(
+        last_closed["timestamp"]
     )
 
-    direction = opportunity.get(
-        "direction"
-    )
+    if (
+        opp.get("last_processed_m5_timestamp")
+        == candle_timestamp
+    ):
+        return False, None
 
-    entry = float(
-        opportunity.get(
-            "entry_price"
+    high = float(last_closed["high"])
+    low = float(last_closed["low"])
+    close = float(last_closed["close"])
+
+    if direction == "HAUSSIER":
+        confirmed = (
+            low < trigger
+            and close > trigger
         )
-    )
-
-    initial_sl = float(
-        opportunity.get(
-            "initial_sl"
-        )
-    )
-
-    df_m5 = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="5m",
-        count=100
-    )
-
-    if df_m5.empty or len(df_m5) < 4:
-
-        logging.warning(
-            f"Données M5 insuffisantes "
-            f"pour {symbol}."
+    else:
+        confirmed = (
+            high > trigger
+            and close < trigger
         )
 
-        return "WAIT", None
+    return confirmed, candle_timestamp
 
-    last_m5 = df_m5.iloc[-2]
 
-    m5_open = float(
-        last_m5["open"]
+def _find_last_opposite_pivot(
+    pivots,
+    direction,
+    before_index
+):
+    wanted = (
+        "LOW"
+        if direction == "HAUSSIER"
+        else "HIGH"
     )
 
-    m5_close = float(
-        last_m5["close"]
+    candidates = [
+        p
+        for p in pivots
+        if p["type"] == wanted
+        and p["index"] < before_index
+    ]
+
+    return candidates[-1] if candidates else None
+
+
+def check_m1_choch(
+    df,
+    opp
+):
+    """
+    Détection du CHoCH M1 après la liquidité M5.
+
+    Le niveau cassé est le dernier pivot local opposé.
+    Le SL est le dernier pivot local dans le sens du retracement.
+    """
+
+    if df is None or len(df) < 10:
+        return None
+
+    pivots = detect_pivots(
+        df,
+        M1_PIVOT_LEFT,
+        M1_PIVOT_RIGHT
     )
 
-    m5_high = float(
-        last_m5["high"]
-    )
+    if not pivots:
+        return None
 
-    m5_low = float(
-        last_m5["low"]
-    )
+    closed_index = len(df) - 2
+    candle = df.iloc[closed_index]
+    close = float(candle["close"])
 
-    # ======================================
-    # INVALIDATION PAR LE SL
-    # ======================================
+    direction = opp["direction"]
 
-    if direction == "BUY":
+    m5_timestamp = opp.get("m5_liquidity_timestamp")
 
-        if m5_low <= initial_sl:
+    if m5_timestamp:
+        eligible_pivots = [
+            p for p in pivots
+            if str(p["timestamp"]) > str(m5_timestamp)
+        ]
+    else:
+        eligible_pivots = pivots
 
-            return "INVALIDATED", None
+    if direction == "HAUSSIER":
+        candidates = [
+            p for p in eligible_pivots
+            if p["type"] == "HIGH"
+            and p["index"] < closed_index
+        ]
+        if not candidates:
+            return None
 
-        m5_direction_ok = (
-            m5_close > m5_open
-            and
-            m5_close >= entry
+        broken = candidates[-1]
+
+        if close <= broken["price"]:
+            return None
+
+        sl_pivot = _find_last_opposite_pivot(
+            eligible_pivots,
+            direction,
+            closed_index
         )
 
     else:
+        candidates = [
+            p for p in eligible_pivots
+            if p["type"] == "LOW"
+            and p["index"] < closed_index
+        ]
+        if not candidates:
+            return None
 
-        if m5_high >= initial_sl:
+        broken = candidates[-1]
 
-            return "INVALIDATED", None
+        if close >= broken["price"]:
+            return None
 
-        m5_direction_ok = (
-            m5_close < m5_open
-            and
-            m5_close <= entry
+        sl_pivot = _find_last_opposite_pivot(
+            eligible_pivots,
+            direction,
+            closed_index
         )
 
-    if not m5_direction_ok:
+    if sl_pivot is None:
+        return None
 
-        return "WAIT", None
-
-    m5_pattern = detect_patterns(
-        df_m5
-    )
-
-    if direction == "BUY":
-
-        pattern_ok = m5_pattern in [
-            "AVALEMENT_HAUSSIER",
-            "MARTEAU"
-        ]
-
-    else:
-
-        pattern_ok = m5_pattern in [
-            "AVALEMENT_BAISSIER",
-            "ETOILE_FILANTE"
-        ]
-
-    # ======================================
-    # M5 CONFIRMÉ
-    # ======================================
-
-    confirmation = {
-        "m5_pattern": m5_pattern,
-        "m5_open": m5_open,
-        "m5_close": m5_close,
-        "m5_high": m5_high,
-        "m5_low": m5_low,
-        "pattern_ok": pattern_ok
+    return {
+        "timestamp": str(candle["timestamp"]),
+        "broken_level": float(broken["price"]),
+        "sl": float(sl_pivot["price"]),
+        "sl_timestamp": str(sl_pivot["timestamp"]),
+        "pivot_index": int(broken["index"])
     }
 
-    return "CONFIRMED", confirmation
 
-
-# ==========================================
-# VÉRIFICATION M1 SI NÉCESSAIRE
-# ==========================================
-
-def evaluate_m1_if_necessary(
-    opportunity,
-    m5_confirmation
+def _find_order_block(
+    df,
+    bos_index,
+    direction
 ):
     """
-    M1 est utilisé uniquement lorsque le mouvement
-    M5 est déjà confirmé mais que le prix s'est éloigné
-    de manière importante du prix de référence M15.
-
-    Si le M5 est proche de l'entrée, M1 n'est pas
-    nécessaire.
-
-    Lorsque M1 est utilisé, une confirmation dans le
-    même sens permet de finaliser le signal.
+    Order Block = dernière bougie opposée au mouvement
+    immédiatement avant le déplacement ayant produit le BOS.
     """
 
-    symbol = opportunity.get(
-        "symbol"
+    if bos_index <= 0:
+        return None
+
+    for i in range(
+        bos_index - 1,
+        max(-1, bos_index - 8),
+        -1
+    ):
+        candle = df.iloc[i]
+        open_price = float(candle["open"])
+        close_price = float(candle["close"])
+
+        if direction == "HAUSSIER":
+            if close_price < open_price:
+                return {
+                    "index": int(i),
+                    "timestamp": str(
+                        candle["timestamp"]
+                    ),
+                    "open": open_price,
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": close_price,
+                    "type": "ORDER_BLOCK_HAUSSIER"
+                }
+
+        else:
+            if close_price > open_price:
+                return {
+                    "index": int(i),
+                    "timestamp": str(
+                        candle["timestamp"]
+                    ),
+                    "open": open_price,
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": close_price,
+                    "type": "ORDER_BLOCK_BAISSIER"
+                }
+
+    return None
+
+
+def check_m1_bos(
+    df,
+    opp
+):
+    """
+    Après CHoCH, recherche un nouveau pivot puis sa cassure.
+    """
+
+    if df is None or len(df) < 12:
+        return None
+
+    pivots = detect_pivots(
+        df,
+        M1_PIVOT_LEFT,
+        M1_PIVOT_RIGHT
     )
 
-    direction = opportunity.get(
-        "direction"
+    if not pivots:
+        return None
+
+    choch_timestamp = str(
+        opp.get("m1_choch_timestamp")
     )
 
-    entry = float(
-        opportunity.get(
-            "entry_price"
+    closed_df = df.iloc[:-1].copy()
+
+    choch_positions = [
+        i
+        for i, value in enumerate(
+            closed_df["timestamp"].astype(str)
         )
-    )
+        if value == choch_timestamp
+    ]
 
-    m5_close = float(
-        m5_confirmation.get(
-            "m5_close"
-        )
-    )
+    if not choch_positions:
+        return None
 
-    df_m5 = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="5m",
-        count=100
-    )
+    choch_index = choch_positions[-1]
+    closed_index = len(df) - 2
+    direction = opp["direction"]
 
-    if df_m5.empty or len(df_m5) < 20:
-
-        return True, False
-
-    df_m5_indicators = calculate_indicators(
-        df_m5
-    )
-
-    last_m5 = df_m5_indicators.iloc[-2]
-
-    atr14 = last_m5.get(
-        "atr14"
-    )
-
-    if pd.isna(atr14) or float(atr14) <= 0:
-
-        return True, False
-
-    atr14 = float(atr14)
-
-    distance = abs(
-        m5_close
-        - entry
-    )
-
-    # M1 n'est nécessaire que si le prix s'est
-    # éloigné de plus de 0.25 ATR M5.
-    m1_needed = (
-        distance
-        > (
-            atr14
-            * 0.25
-        )
-    )
-
-    if not m1_needed:
-
-        return True, False
-
-    logging.info(
-        f"M1 nécessaire pour {symbol} "
-        f"après confirmation M5."
-    )
-
-    df_m1 = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="1m",
-        count=100
-    )
-
-    if df_m1.empty or len(df_m1) < 4:
-
-        logging.warning(
-            f"Données M1 insuffisantes "
-            f"pour {symbol}. "
-            f"Surveillance maintenue."
-        )
-
-        return False, True
-
-    m1_pattern = detect_patterns(
-        df_m1
-    )
-
-    if direction == "BUY":
-
-        m1_ok = m1_pattern in [
-            "AVALEMENT_HAUSSIER",
-            "MARTEAU"
+    if direction == "HAUSSIER":
+        candidates = [
+            p
+            for p in pivots
+            if p["type"] == "HIGH"
+            and choch_index < p["index"] < closed_index
         ]
+
+        if not candidates:
+            return None
+
+        target = candidates[-1]
+
+        if float(df["close"].iloc[closed_index]) <= target["price"]:
+            return None
 
     else:
-
-        m1_ok = m1_pattern in [
-            "AVALEMENT_BAISSIER",
-            "ETOILE_FILANTE"
+        candidates = [
+            p
+            for p in pivots
+            if p["type"] == "LOW"
+            and choch_index < p["index"] < closed_index
         ]
 
-    if not m1_ok:
+        if not candidates:
+            return None
 
-        logging.info(
-            f"M1 ne confirme pas encore "
-            f"{direction} pour {symbol}."
-        )
+        target = candidates[-1]
 
-        return False, True
+        if float(df["close"].iloc[closed_index]) >= target["price"]:
+            return None
 
-    logging.info(
-        f"M1 confirme {direction} pour {symbol}."
+    order_block = _find_order_block(
+        df,
+        target["index"],
+        direction
     )
 
-    return True, True
-
-
-# ==========================================
-# TRANSFORMATION DE L'OPPORTUNITÉ
-# EN SIGNAL FINAL
-# ==========================================
-
-def finalize_pending_opportunity(
-    candidate_id,
-    opportunity
-):
-    """
-    Transforme une opportunité M15 confirmée par M5/M1
-    en trade actif.
-
-    Les valeurs Entry / SL / TP sont reprises
-    exactement de l'opportunité M15.
-    """
-
-    opportunities = load_json(
-        OPPORTUNITIES_FILE
-    )
-
-    active_trades = load_json(
-        TRADES_FILE
-    )
-
-    if candidate_id not in opportunities:
-
-        return False
-
-    direction = opportunity.get(
-        "direction"
-    )
-
-    symbol = opportunity.get(
-        "symbol"
-    )
+    if order_block is None:
+        return None
 
     entry = float(
-        opportunity.get(
-            "entry_price"
-        )
+        order_block["open"]
     )
 
     sl = float(
-        opportunity.get(
-            "initial_sl"
-        )
+        opp["m1_sl"]
     )
 
-    tp1 = float(
-        opportunity.get(
-            "tp1"
-        )
-    )
+    if direction == "HAUSSIER":
+        if sl >= entry:
+            return None
+    else:
+        if sl <= entry:
+            return None
 
-    tp2 = float(
-        opportunity.get(
-            "tp2"
-        )
-    )
-
-    tp3 = float(
-        opportunity.get(
-            "tp3"
-        )
-    )
-
-    pattern = opportunity.get(
-        "pattern"
-    )
-
-    filter_score = opportunity.get(
-        "filter_score"
-    )
-
-    indicators = opportunity.get(
-        "indicators",
-        {}
-    )
-
-    trade_id = (
-        f"TRADE_{direction}_"
-        f"{symbol}_"
-        f"{int(time.time())}"
-    )
-
-    active_trades[
-        trade_id
-    ] = {
-
-        "symbol": symbol,
-
-        "direction": direction,
-
+    return {
+        "timestamp": str(
+            df["timestamp"].iloc[closed_index]
+        ),
+        "bos_level": float(target["price"]),
+        "bos_pivot_timestamp": str(
+            target["timestamp"]
+        ),
+        "order_block": order_block,
         "entry_price": entry,
-
-        "initial_sl": sl,
-
-        "current_sl": sl,
-
-        "tp1": tp1,
-
-        "tp2": tp2,
-
-        "tp3": tp3,
-
-        "status": "ACTIVE",
-
-        "pattern": pattern,
-
-        "filter_score": filter_score,
-
-        "indicators": indicators,
-
-        "created_at": (
-            datetime.utcnow()
-            .isoformat()
-        )
+        "sl": sl
     }
 
-    save_json(
-        TRADES_FILE,
-        active_trades
+
+def _find_m15_take_profit(
+    symbol,
+    direction
+):
+    df = fetch_biquote_ohlcv(
+        symbol,
+        timeframe="15m",
+        count=200
     )
 
-    ensure_trade_history_record(
-        trade_id,
-        active_trades[
-            trade_id
+    if df.empty or len(df) < 30:
+        return None
+
+    pivots = detect_pivots(
+        df,
+        M15_PIVOT_LEFT,
+        M15_PIVOT_RIGHT
+    )
+
+    closed_index = len(df) - 2
+
+    if direction == "HAUSSIER":
+        candidates = [
+            p for p in pivots
+            if p["type"] == "HIGH"
+            and p["index"] < closed_index
         ]
-    )
-
-    if direction == "BUY":
-
-        send_telegram_message(
-            f"🟢 *SIGNAL ACHAT (BUY) "
-            f"via BIQUOTE*\n"
-            f"Actif: {symbol}\n"
-            f"Motif: {pattern}\n"
-            f"Confirmation: M15 → M5"
-            f" → M1 si nécessaire\n"
-            f"Filtre: "
-            f"{filter_score}/4\n"
-            f"EMA20/50: "
-            f"{indicators.get('ema20', 0):.5f} / "
-            f"{indicators.get('ema50', 0):.5f}\n"
-            f"RSI14: "
-            f"{indicators.get('rsi14', 0):.2f}\n"
-            f"ATR14: "
-            f"{indicators.get('atr14', 0):.5f}\n"
-            f"ADX14: "
-            f"{indicators.get('adx14', 0):.2f}\n"
-            f"Entrée: {entry:.2f}\n"
-            f"SL Initial: {sl:.2f}\n"
-            f"TP1: "
-            f"{tp1:.2f}\n"
-            f"TP2: "
-            f"{tp2:.2f}\n"
-            f"TP3: "
-            f"{tp3:.2f}"
-        )
-
     else:
+        candidates = [
+            p for p in pivots
+            if p["type"] == "LOW"
+            and p["index"] < closed_index
+        ]
 
-        send_telegram_message(
-            f"🔴 *SIGNAL VENTE "
-            f"(SHORT) via BIQUOTE*\n"
-            f"Actif: {symbol}\n"
-            f"Motif: {pattern}\n"
-            f"Confirmation: M15 → M5"
-            f" → M1 si nécessaire\n"
-            f"Filtre: "
-            f"{filter_score}/4\n"
-            f"EMA20/50: "
-            f"{indicators.get('ema20', 0):.5f} / "
-            f"{indicators.get('ema50', 0):.5f}\n"
-            f"RSI14: "
-            f"{indicators.get('rsi14', 0):.2f}\n"
-            f"ATR14: "
-            f"{indicators.get('atr14', 0):.5f}\n"
-            f"ADX14: "
-            f"{indicators.get('adx14', 0):.2f}\n"
-            f"Entrée: {entry:.2f}\n"
-            f"SL Initial: {sl:.2f}\n"
-            f"TP1: "
-            f"{tp1:.2f}\n"
-            f"TP2: "
-            f"{tp2:.2f}\n"
-            f"TP3: "
-            f"{tp3:.2f}"
+    if not candidates:
+        return None
+
+    return float(
+        candidates[-1]["price"]
+    )
+
+
+def _build_active_trade(
+    candidate_id,
+    opp,
+    execution
+):
+    symbol = opp["symbol"]
+    direction = opp["direction"]
+
+    entry = float(
+        execution["entry_price"]
+    )
+    sl = float(
+        execution["sl"]
+    )
+
+    tp = _find_m15_take_profit(
+        symbol,
+        direction
+    )
+
+    if tp is None:
+        return None
+
+    if direction == "HAUSSIER":
+        risk = entry - sl
+        reward = tp - entry
+        trade_direction = "BUY"
+    else:
+        risk = sl - entry
+        reward = entry - tp
+        trade_direction = "SELL"
+
+    if risk <= 0 or reward <= 0:
+        logging.info(
+            f"[M1] {symbol} {direction}: "
+            f"TP M15 invalide pour l'entrée OB."
         )
+        return None
 
-    opportunities.pop(
+    rr = reward / risk
+
+    trade_id = (
+        f"TRADE_{trade_direction}_{symbol}_"
+        f"{int(time.time() * 1000)}"
+    )
+
+    order_block = execution["order_block"]
+
+    return trade_id, {
+        "symbol": symbol,
+        "direction": trade_direction,
+        "entry_price": entry,
+        "initial_sl": sl,
+        "current_sl": sl,
+        "tp1": tp,
+        "tp2": tp,
+        "tp3": tp,
+        "tp": tp,
+        "rr_theoretical": rr,
+        "status": "PENDING_LIMIT",
+        "execution_type": "SIMULATED_LIMIT",
+        "order_block": order_block,
+        "m15_trigger_price": float(
+            opp["trigger_price"]
+        ),
+        "m15_bos_price": float(
+            opp["m15_bos_price"]
+        ),
+        "m1_choch_level": opp.get(
+            "m1_choch_level"
+        ),
+        "m1_bos_level": execution.get(
+            "bos_level"
+        ),
+        "candidate_id": candidate_id,
+        "created_at": strategy_timestamp()
+    }
+
+
+def execute_m1_order(
+    candidate_id,
+    opp,
+    execution
+):
+    """
+    Enregistre le limit simulé dans active_trades.json.
+    L'alerte Telegram est envoyée uniquement après sauvegarde réussie.
+    """
+
+    result = _build_active_trade(
         candidate_id,
-        None
+        opp,
+        execution
     )
 
-    save_json(
-        OPPORTUNITIES_FILE,
-        opportunities
-    )
+    if result is None:
+        return False
 
-    logging.info(
-        f"{direction} final créé : "
-        f"{trade_id} pour {symbol}."
-    )
+    trade_id, trade = result
 
-    return True
-
-
-# ==========================================
-# SURVEILLANCE DES OPPORTUNITÉS M5
-# ==========================================
-
-def scan_pending_opportunities_m5():
-    """
-    Parcourt les opportunités détectées par M15.
-
-    Flux :
-        M15 → opportunité
-             ↓
-        M5 surveillance
-             ↓
-        M1 si nécessaire
-             ↓
-        signal final
-    """
-
-    opportunities = load_json(
-        OPPORTUNITIES_FILE
-    )
-
-    if not opportunities:
-
-        return
-
-    opportunities_to_delete = []
-
-    for candidate_id, opportunity in list(
-        opportunities.items()
-    ):
-
-        try:
-
-            if opportunity.get(
-                "status"
-            ) != "M5_SURVEILLANCE":
-
-                continue
-
-            symbol = opportunity.get(
-                "symbol"
-            )
-
-            direction = opportunity.get(
-                "direction"
-            )
-
-            result, m5_confirmation = (
-                evaluate_m5_opportunity(
-                    opportunity
-                )
-            )
-
-            if result == "INVALIDATED":
-
-                logging.info(
-                    f"Opportunité {candidate_id} "
-                    f"invalide par le M5."
-                )
-
-                opportunities_to_delete.append(
-                    candidate_id
-                )
-
-                continue
-
-            if result != "CONFIRMED":
-
-                continue
-
-            # ==================================
-            # M5 CONFIRMÉ
-            # ==================================
-
-            opportunity[
-                "status"
-            ] = "M5_CONFIRMED"
-
-            opportunity[
-                "m5_confirmation"
-            ] = m5_confirmation
-
-            should_finalize, m1_used = (
-                evaluate_m1_if_necessary(
-                    opportunity,
-                    m5_confirmation
-                )
-            )
-
-            if not should_finalize:
-
-                opportunity[
-                    "status"
-                ] = "M5_SURVEILLANCE"
-
-                opportunities[
-                    candidate_id
-                ] = opportunity
-
-                if m1_used:
-
-                    logging.info(
-                        f"{symbol} {direction} : "
-                        f"M5 confirmé, M1 en attente."
-                    )
-
-                continue
-
-            # ==================================
-            # SIGNAL FINAL
-            # ==================================
-
-            finalize_pending_opportunity(
-                candidate_id,
-                opportunity
-            )
-
-            opportunities_to_delete.append(
-                candidate_id
-            )
-
-        except Exception as e:
-
-            logging.exception(
-                f"Erreur surveillance M5 "
-                f"{candidate_id}: {e}"
-            )
-
-    for candidate_id in opportunities_to_delete:
-
-        opportunities.pop(
-            candidate_id,
-            None
-        )
-
-    save_json(
-        OPPORTUNITIES_FILE,
-        opportunities
-    )
-
-
-# ==========================================
-# SUIVI DES TRADES
-# ==========================================
-
-def track_active_trades():
-
-    logging.info(
-        "Thread de suivi des trades démarré."
-    )
-
-    while True:
-
-        try:
-
-            generate_weekly_report()
-
+    with MARKET_EXECUTION_LOCK:
+        with JSON_LOCK:
             active_trades = load_json(
                 TRADES_FILE
             )
 
-            if not active_trades:
-
-                time.sleep(10)
-                continue
-
-            prices = {}
-
-            symbols_in_trades = set()
-
-            for trade in active_trades.values():
-
-                symbol = trade.get(
-                    "symbol"
-                )
-
-                if symbol:
-
-                    symbols_in_trades.add(
-                        symbol
-                    )
-
-            for symbol in symbols_in_trades:
-
-                prices[symbol] = (
-                    fetch_biquote_live_price(
-                        symbol
-                    )
-                )
-
-            trades_to_delete = []
-
-            for t_id, trade in list(
-                active_trades.items()
-            ):
-
-                try:
-
-                    symbol = trade.get(
-                        "symbol"
-                    )
-
-                    if not symbol:
-                        continue
-
-                    current_price = (
-                        prices.get(
-                            symbol
-                        )
-                    )
-
-                    if current_price is None:
-                        continue
-
-                    direction = trade[
-                        "direction"
-                    ]
-
-                    entry = float(
-                        trade["entry_price"]
-                    )
-
-                    current_sl = float(
-                        trade["current_sl"]
-                    )
-
-                    tp1 = float(
-                        trade["tp1"]
-                    )
-
-                    tp2 = float(
-                        trade["tp2"]
-                    )
-
-                    tp3 = float(
-                        trade["tp3"]
-                    )
-
-                    status = trade.get(
-                        "status",
-                        "ACTIVE"
-                    )
-
-                    if direction == "BUY":
-
-                        if current_price <= current_sl:
-
-                            send_telegram_message(
-                                f"❌ *SL Touché* sur "
-                                f"{symbol} "
-                                f"à {current_price:.2f}.\n"
-                                f"Trade clos."
-                            )
-
-                            close_trade_in_history(
-                                t_id,
-                                "SL",
-                                current_price
-                            )
-
-                            trades_to_delete.append(
-                                t_id
-                            )
-
-                        elif (
-                            current_price >= tp1
-                            and status == "ACTIVE"
-                        ):
-
-                            trade["status"] = (
-                                "TP1_HIT"
-                            )
-
-                            trade["current_sl"] = (
-                                entry
-                            )
-
-                            record_trade_event(
-                                t_id,
-                                "TP1_HIT",
-                                tp1
-                            )
-
-                            record_trade_event(
-                                t_id,
-                                "BREAK_EVEN",
-                                entry
-                            )
-
-                            send_telegram_message(
-                                f"🎯 *TP1 Atteint* "
-                                f"sur {symbol} "
-                                f"({tp1:.2f}) !\n"
-                                f"🛡️ SL déplacé au "
-                                f"Break-Even."
-                            )
-
-                        elif (
-                            current_price >= tp2
-                            and status == "TP1_HIT"
-                        ):
-
-                            trade["status"] = (
-                                "TP2_HIT"
-                            )
-
-                            trade["current_sl"] = (
-                                tp1
-                            )
-
-                            record_trade_event(
-                                t_id,
-                                "TP2_HIT",
-                                tp2
-                            )
-
-                            send_telegram_message(
-                                f"🎯🎯 *TP2 Atteint* "
-                                f"sur {symbol} "
-                                f"({tp2:.2f}) !\n"
-                                f"🔒 SL déplacé au "
-                                f"niveau du TP1."
-                            )
-
-                        elif current_price >= tp3:
-
-                            record_trade_event(
-                                t_id,
-                                "TP3_HIT",
-                                tp3
-                            )
-
-                            close_trade_in_history(
-                                t_id,
-                                "TP3",
-                                current_price
-                            )
-
-                            send_telegram_message(
-                                f"🏆 *TP3 Atteint* "
-                                f"sur {symbol} "
-                                f"({tp3:.2f}).\n"
-                                f"Trade terminé."
-                            )
-
-                            trades_to_delete.append(
-                                t_id
-                            )
-
-                    elif direction == "SELL":
-
-                        if current_price >= current_sl:
-
-                            send_telegram_message(
-                                f"❌ *SL Touché* "
-                                f"(Short) sur "
-                                f"{symbol} "
-                                f"à {current_price:.2f}.\n"
-                                f"Trade clos."
-                            )
-
-                            close_trade_in_history(
-                                t_id,
-                                "SL",
-                                current_price
-                            )
-
-                            trades_to_delete.append(
-                                t_id
-                            )
-
-                        elif (
-                            current_price <= tp1
-                            and status == "ACTIVE"
-                        ):
-
-                            trade["status"] = (
-                                "TP1_HIT"
-                            )
-
-                            trade["current_sl"] = (
-                                entry
-                            )
-
-                            record_trade_event(
-                                t_id,
-                                "TP1_HIT",
-                                tp1
-                            )
-
-                            record_trade_event(
-                                t_id,
-                                "BREAK_EVEN",
-                                entry
-                            )
-
-                            send_telegram_message(
-                                f"🎯 *TP1 Atteint* "
-                                f"(Short) sur "
-                                f"{symbol} "
-                                f"({tp1:.2f}) !\n"
-                                f"🛡️ SL déplacé au "
-                                f"Break-Even."
-                            )
-
-                        elif (
-                            current_price <= tp2
-                            and status == "TP1_HIT"
-                        ):
-
-                            trade["status"] = (
-                                "TP2_HIT"
-                            )
-
-                            trade["current_sl"] = (
-                                tp1
-                            )
-
-                            record_trade_event(
-                                t_id,
-                                "TP2_HIT",
-                                tp2
-                            )
-
-                            send_telegram_message(
-                                f"🎯🎯 *TP2 Atteint* "
-                                f"(Short) sur "
-                                f"{symbol} "
-                                f"({tp2:.2f}) !\n"
-                                f"🔒 SL déplacé au "
-                                f"niveau du TP1."
-                            )
-
-                        elif current_price <= tp3:
-
-                            record_trade_event(
-                                t_id,
-                                "TP3_HIT",
-                                tp3
-                            )
-
-                            close_trade_in_history(
-                                t_id,
-                                "TP3",
-                                current_price
-                            )
-
-                            send_telegram_message(
-                                f"🏆 *TP3 Atteint* "
-                                f"sur {symbol} "
-                                f"({tp3:.2f}).\n"
-                                f"Trade terminé."
-                            )
-
-                            trades_to_delete.append(
-                                t_id
-                            )
-
-                except Exception as e:
-
-                    logging.error(
-                        f"Erreur traitement trade "
-                        f"{t_id}: {e}"
-                    )
-
-            for t_id in trades_to_delete:
-
-                active_trades.pop(
-                    t_id,
-                    None
-                )
-
+            for existing in active_trades.values():
+                if (
+                    existing.get("candidate_id")
+                    == candidate_id
+                ):
+                    return False
+
+            active_trades[trade_id] = trade
             save_json(
                 TRADES_FILE,
                 active_trades
             )
 
-        except Exception as e:
+        ensure_trade_history_record(
+            trade_id,
+            trade
+        )
 
-            logging.exception(
-                f"Erreur dans le suivi "
-                f"temps réel : {e}"
+    entry = float(trade["entry_price"])
+    sl = float(trade["initial_sl"])
+    tp = float(trade["tp"])
+    rr = float(trade["rr_theoretical"])
+
+    direction_text = (
+        "ACHAT"
+        if trade["direction"] == "BUY"
+        else "VENTE"
+    )
+
+    symbol = trade["symbol"]
+
+    message = (
+        f"{'🟢' if trade['direction'] == 'BUY' else '🔴'} "
+        f"*{direction_text} {symbol}*\n"
+        f"Direction : {direction_text}\n"
+        f"Entrée OB M1 : `{entry:.8f}`\n"
+        f"SL : `{sl:.8f}`\n"
+        f"TP M15 : `{tp:.8f}`\n"
+        f"RR théorique : `1:{rr:.2f}`"
+    )
+
+    if send_telegram_message(message):
+        logging.info(
+            f"[EXECUTION] {trade_id} enregistré et "
+            f"alerte Telegram envoyée."
+        )
+    else:
+        logging.error(
+            f"[EXECUTION] {trade_id} enregistré, "
+            f"mais Telegram n'a pas confirmé l'envoi."
+        )
+
+    return True
+
+
+def _stage_age_expired(
+    opportunity,
+    df_m1=None
+):
+    """
+    Expiration basée sur le nombre de bougies M1 clôturées
+    depuis le début de l'étape active.
+    """
+
+    if df_m1 is None or df_m1.empty:
+        return False
+
+    stage_started = opportunity.get(
+        "stage_started_at"
+    )
+
+    if not stage_started:
+        return False
+
+    try:
+        stage_dt = datetime.strptime(
+            stage_started,
+            "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=timezone.utc)
+    except Exception:
+        return False
+
+    now = utc_datetime()
+    minutes = max(
+        0,
+        int(
+            (now - stage_dt).total_seconds()
+            / 60
+        )
+    )
+
+    elapsed_m1_candles = minutes
+
+    return (
+        elapsed_m1_candles
+        >= OPPORTUNITY_EXPIRY_CANDLES
+    )
+
+
+def _update_opportunity(
+    candidate_id,
+    updates
+):
+    with JSON_LOCK:
+        opportunities = load_json(
+            OPPORTUNITIES_FILE
+        )
+
+        opportunity = opportunities.get(
+            candidate_id
+        )
+
+        if opportunity is None:
+            return None
+
+        opportunity.update(updates)
+        opportunities[candidate_id] = opportunity
+        save_json(
+            OPPORTUNITIES_FILE,
+            opportunities
+        )
+
+        return opportunity
+
+
+def _delete_opportunity(
+    candidate_id
+):
+    with JSON_LOCK:
+        opportunities = load_json(
+            OPPORTUNITIES_FILE
+        )
+        opportunities.pop(
+            candidate_id,
+            None
+        )
+        save_json(
+            OPPORTUNITIES_FILE,
+            opportunities
+        )
+
+
+def _process_pending_opportunity(
+    candidate_id,
+    opportunity
+):
+    symbol = opportunity.get("symbol")
+
+    if symbol not in SYMBOLS:
+        _delete_opportunity(candidate_id)
+        return
+
+    status = opportunity.get("status")
+
+    try:
+        if status == "WAITING_M5_LIQUIDITY":
+            df_m5 = fetch_biquote_ohlcv(
+                symbol,
+                timeframe="5m",
+                count=100
             )
 
-        time.sleep(10)
+            if df_m5.empty:
+                return
+
+            if _stage_age_expired(
+                opportunity,
+                df_m5
+            ):
+                logging.info(
+                    f"[EXPIRATION] {candidate_id} expiré en M5."
+                )
+                _delete_opportunity(candidate_id)
+                return
+
+            confirmed, candle_timestamp = (
+                check_m5_liquidity(
+                    df_m5,
+                    opportunity
+                )
+            )
+
+            if candle_timestamp is not None:
+                _update_opportunity(
+                    candidate_id,
+                    {
+                        "last_processed_m5_timestamp":
+                            candle_timestamp
+                    }
+                )
+
+            if not confirmed:
+                return
+
+            updated = _update_opportunity(
+                candidate_id,
+                {
+                    "status": "WAITING_M1_CHOCH",
+                    "stage_started_at":
+                        strategy_timestamp(),
+                    "m5_liquidity_timestamp":
+                        candle_timestamp
+                }
+            )
+
+            logging.info(
+                f"[M5] {symbol} | "
+                f"liquidité validée | "
+                f"status=WAITING_M1_CHOCH"
+            )
+
+            opportunity = updated or opportunity
+            status = "WAITING_M1_CHOCH"
+
+        if status == "WAITING_M1_CHOCH":
+            df_m1 = fetch_biquote_ohlcv(
+                symbol,
+                timeframe="1m",
+                count=150
+            )
+
+            if df_m1.empty:
+                return
+
+            if _stage_age_expired(
+                opportunity,
+                df_m1
+            ):
+                logging.info(
+                    f"[EXPIRATION] {candidate_id} expiré en CHoCH."
+                )
+                _delete_opportunity(candidate_id)
+                return
+
+            choch = check_m1_choch(
+                df_m1,
+                opportunity
+            )
+
+            last_m1 = _last_closed_timestamp(
+                df_m1
+            )
+
+            if choch is None:
+                if last_m1 is not None:
+                    _update_opportunity(
+                        candidate_id,
+                        {
+                            "last_processed_m1_timestamp":
+                                last_m1
+                        }
+                    )
+                return
+
+            updated = _update_opportunity(
+                candidate_id,
+                {
+                    "status": "WAITING_M1_BOS",
+                    "stage_started_at":
+                        strategy_timestamp(),
+                    "m1_choch_timestamp":
+                        choch["timestamp"],
+                    "m1_choch_level":
+                        choch["broken_level"],
+                    "m1_sl":
+                        choch["sl"],
+                    "m1_sl_timestamp":
+                        choch["sl_timestamp"]
+                }
+            )
+
+            logging.info(
+                f"[M1-CHOCH] {symbol} | "
+                f"{opportunity['direction']} | "
+                f"niveau={choch['broken_level']:.8f} | "
+                f"SL={choch['sl']:.8f} | "
+                f"status=WAITING_M1_BOS"
+            )
+
+            opportunity = updated or opportunity
+            status = "WAITING_M1_BOS"
+
+        if status == "WAITING_M1_BOS":
+            df_m1 = fetch_biquote_ohlcv(
+                symbol,
+                timeframe="1m",
+                count=200
+            )
+
+            if df_m1.empty:
+                return
+
+            if _stage_age_expired(
+                opportunity,
+                df_m1
+            ):
+                logging.info(
+                    f"[EXPIRATION] {candidate_id} expiré en BOS."
+                )
+                _delete_opportunity(candidate_id)
+                return
+
+            bos = check_m1_bos(
+                df_m1,
+                opportunity
+            )
+
+            last_m1 = _last_closed_timestamp(
+                df_m1
+            )
+
+            if bos is None:
+                if last_m1 is not None:
+                    _update_opportunity(
+                        candidate_id,
+                        {
+                            "last_processed_m1_timestamp":
+                                last_m1
+                        }
+                    )
+                return
+
+            updated = _update_opportunity(
+                candidate_id,
+                {
+                    "m1_bos_timestamp":
+                        bos["timestamp"],
+                    "m1_bos_level":
+                        bos["bos_level"],
+                    "order_block":
+                        bos["order_block"]
+                }
+            )
+
+            if updated is None:
+                return
+
+            logging.info(
+                f"[M1-BOS] {symbol} | "
+                f"BOS={bos['bos_level']:.8f} | "
+                f"OB={bos['order_block']['open']:.8f}"
+            )
+
+            if execute_m1_order(
+                candidate_id,
+                updated,
+                bos
+            ):
+                _delete_opportunity(
+                    candidate_id
+                )
+
+    except Exception as e:
+        logging.exception(
+            f"[SMC] Erreur opportunité "
+            f"{candidate_id}/{symbol}: {e}"
+        )
+
+
+def scan_pending_opportunities_m5():
+    """
+    Traite chaque opportunité indépendamment.
+    """
+
+    with JSON_LOCK:
+        opportunities = load_json(
+            OPPORTUNITIES_FILE
+        )
+
+    if not opportunities:
+        return
+
+    snapshot = [
+        (candidate_id, opportunity.copy())
+        for candidate_id, opportunity
+        in opportunities.items()
+    ]
+
+    workers = max(
+        1,
+        min(
+            SCAN_WORKERS,
+            len(snapshot)
+        )
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="smc-pending"
+    ) as executor:
+        futures = [
+            executor.submit(
+                _process_pending_opportunity,
+                candidate_id,
+                opportunity
+            )
+            for candidate_id, opportunity in snapshot
+        ]
+
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.exception(
+                    f"[SMC] Erreur worker pending: {e}"
+                )
+
+
+def scan_all_symbols_m15():
+    """
+    Les quatre marchés sont analysés en parallèle.
+    Une panne d'un actif n'arrête jamais les trois autres.
+    """
+
+    with ThreadPoolExecutor(
+        max_workers=SCAN_WORKERS,
+        thread_name_prefix="m15-symbol"
+    ) as executor:
+        futures = {
+            executor.submit(
+                scan_market_m15,
+                symbol
+            ): symbol
+            for symbol in SYMBOLS
+        }
+
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                logging.exception(
+                    f"[M15] Worker {symbol} en erreur: {e}"
+                )
 
 
 # ==========================================
-# PLANIFICATEUR MULTI-TIMEFRAME
+# SCHEDULER MULTI-TIMEFRAME
 # ==========================================
 
 def main_scheduler():
-
     logging.info(
-        "Thread scheduler multi-timeframe démarré."
+        "Thread scheduler SMC multi-timeframe démarré."
     )
 
     last_m15_slot = None
     last_m5_slot = None
 
     while True:
-
         try:
-
-            now = datetime.now()
-
-            # ==================================
-            # CRÉNEAU M15
-            # ==================================
+            now = datetime.now(timezone.utc)
 
             m15_slot = now.replace(
                 minute=(now.minute // 15) * 15,
@@ -4105,30 +4021,15 @@ def main_scheduler():
 
             if (
                 now.second >= 5
-                and
-                m15_slot != last_m15_slot
+                and m15_slot != last_m15_slot
             ):
-
                 logging.info(
-                    "Nouveau créneau M15 : "
-                    "analyse des opportunités."
+                    "[SCHEDULER] Scan M15 parallèle des 4 actifs."
                 )
 
-                for symbol in SYMBOLS:
-
-                    scan_market_m15(
-                        symbol
-                    )
+                scan_all_symbols_m15()
 
                 last_m15_slot = m15_slot
-
-                logging.info(
-                    "Analyse M15 terminée."
-                )
-
-            # ==================================
-            # CRÉNEAU M5
-            # ==================================
 
             m5_slot = now.replace(
                 minute=(now.minute // 5) * 5,
@@ -4138,34 +4039,217 @@ def main_scheduler():
 
             if (
                 now.second >= 5
-                and
-                m5_slot != last_m5_slot
+                and m5_slot != last_m5_slot
             ):
-
                 logging.info(
-                    "Nouveau créneau M5 : "
-                    "surveillance des opportunités."
+                    "[SCHEDULER] Scan M5/M1 parallèle des opportunités."
                 )
 
                 scan_pending_opportunities_m5()
 
                 last_m5_slot = m5_slot
 
-                logging.info(
-                    "Surveillance M5 terminée."
-                )
-
             time.sleep(1)
 
         except Exception as e:
-
             logging.exception(
-                f"Erreur scheduler multi-timeframe : {e}"
+                f"Erreur scheduler SMC multi-timeframe: {e}"
+            )
+            time.sleep(5)
+
+# ==========================================
+# SUIVI DES TRADES
+# ==========================================
+
+def track_active_trades():
+    logging.info(
+        "Thread de suivi des trades démarré."
+    )
+
+    while True:
+        try:
+            generate_weekly_report()
+
+            active_trades = load_json(
+                TRADES_FILE
             )
 
-            time.sleep(10)
+            if not active_trades:
+                time.sleep(10)
+                continue
+
+            prices = {}
+            symbols_in_trades = {
+                trade.get("symbol")
+                for trade in active_trades.values()
+                if trade.get("symbol")
+            }
+
+            for symbol in symbols_in_trades:
+                prices[symbol] = fetch_biquote_live_price(
+                    symbol
+                )
+
+            trades_to_delete = []
+
+            for trade_id, trade in list(
+                active_trades.items()
+            ):
+                try:
+                    symbol = trade.get("symbol")
+                    if not symbol:
+                        continue
+
+                    current_price = prices.get(symbol)
+                    if current_price is None:
+                        continue
+
+                    direction = trade["direction"]
+                    entry = float(trade["entry_price"])
+                    current_sl = float(trade["current_sl"])
+                    tp = float(
+                        trade.get(
+                            "tp",
+                            trade.get("tp1")
+                        )
+                    )
+                    status = trade.get(
+                        "status",
+                        "ACTIVE"
+                    )
+
+                    if status == "PENDING_LIMIT":
+                        filled = (
+                            current_price <= entry
+                            if direction == "BUY"
+                            else current_price >= entry
+                        )
+
+                        if filled:
+                            trade["status"] = "ACTIVE"
+                            record_trade_event(
+                                trade_id,
+                                "LIMIT_FILLED",
+                                current_price
+                            )
+                            send_telegram_message(
+                                f"🟢 *Ordre limite exécuté* — "
+                                f"{symbol}\n"
+                                f"Entrée : `{entry:.8f}`"
+                            )
+
+                        continue
+
+                    if direction == "BUY":
+                        if current_price <= current_sl:
+                            send_telegram_message(
+                                f"❌ *SL Touché* sur {symbol} "
+                                f"à `{current_price:.8f}`.\n"
+                                f"Trade clos."
+                            )
+
+                            close_trade_in_history(
+                                trade_id,
+                                "SL",
+                                current_price
+                            )
+                            trades_to_delete.append(
+                                trade_id
+                            )
+
+                        elif current_price >= tp:
+                            record_trade_event(
+                                trade_id,
+                                "TP3_HIT",
+                                current_price
+                            )
+                            close_trade_in_history(
+                                trade_id,
+                                "TP3",
+                                current_price
+                            )
+                            send_telegram_message(
+                                f"🏆 *TP Atteint* sur {symbol} "
+                                f"à `{current_price:.8f}`.\n"
+                                f"Trade terminé."
+                            )
+                            trades_to_delete.append(
+                                trade_id
+                            )
+
+                    else:
+                        if current_price >= current_sl:
+                            send_telegram_message(
+                                f"❌ *SL Touché* sur {symbol} "
+                                f"à `{current_price:.8f}`.\n"
+                                f"Trade clos."
+                            )
+
+                            close_trade_in_history(
+                                trade_id,
+                                "SL",
+                                current_price
+                            )
+                            trades_to_delete.append(
+                                trade_id
+                            )
+
+                        elif current_price <= tp:
+                            record_trade_event(
+                                trade_id,
+                                "TP3_HIT",
+                                current_price
+                            )
+                            close_trade_in_history(
+                                trade_id,
+                                "TP3",
+                                current_price
+                            )
+                            send_telegram_message(
+                                f"🏆 *TP Atteint* sur {symbol} "
+                                f"à `{current_price:.8f}`.\n"
+                                f"Trade terminé."
+                            )
+                            trades_to_delete.append(
+                                trade_id
+                            )
+
+                except Exception as e:
+                    logging.error(
+                        f"Erreur traitement trade "
+                        f"{trade_id}: {e}"
+                    )
+
+            if trades_to_delete:
+                with JSON_LOCK:
+                    active_trades = load_json(
+                        TRADES_FILE
+                    )
+                    for trade_id in trades_to_delete:
+                        active_trades.pop(
+                            trade_id,
+                            None
+                        )
+                    save_json(
+                        TRADES_FILE,
+                        active_trades
+                    )
+            else:
+                save_json(
+                    TRADES_FILE,
+                    active_trades
+                )
+
+        except Exception as e:
+            logging.exception(
+                f"Erreur dans le suivi temps réel : {e}"
+            )
+
+        time.sleep(10)
 
 
+# ==========================================
+# PLANIFICATEUR MULTI-TIMEFRAME
 # ==========================================
 # FLASK
 # ==========================================
