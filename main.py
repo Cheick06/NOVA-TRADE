@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
@@ -495,6 +496,12 @@ def telegram_menu_keyboard():
             ],
             [
                 {
+                    "text": "📖 Journal",
+                    "callback_data": "journal"
+                }
+            ],
+            [
+                {
                     "text": "🤖 État du bot",
                     "callback_data": "bot_status"
                 }
@@ -747,6 +754,49 @@ def get_active_signals_message():
     return "\n".join(lines)
 
 
+def get_trading_journal_messages():
+    """Retourne le journal complet en messages Telegram découpés."""
+    history = _load_trade_history_list()
+
+    if not history:
+        return ["📖 *JOURNAL DE TRADING*\n\nAucun signal enregistré."]
+
+    lines = ["📖 *JOURNAL DE TRADING*", f"Total : `{len(history)}`", ""]
+    messages = []
+
+    for trade in history:
+        direction = trade.get("direction", "INCONNUE")
+        result = trade.get("result", "UNKNOWN")
+        status = trade.get("status", "UNKNOWN")
+        lines.extend([
+            f"*{trade.get('symbol', 'INCONNU')}* — {direction}",
+            f"ID : `{trade.get('trade_id', '-')}`",
+            f"Date : `{trade.get('datetime', trade.get('created_at', '-'))}`",
+            f"Entrée : `{float(trade.get('entry', trade.get('entry_price', 0.0))):.8f}`",
+            f"SL : `{float(trade.get('sl', trade.get('initial_sl', 0.0))):.8f}`",
+            f"TP1 : `{float(trade.get('tp1', 0.0)):.8f}`",
+            f"TP2 : `{float(trade.get('tp2', 0.0)):.8f}`",
+            f"TP3 : `{float(trade.get('tp3', 0.0)):.8f}`",
+            f"RR : `1:{float(trade.get('rr_theory', trade.get('rr_theoretical', 0.0))):.2f}`",
+            f"Statut : `{status}`",
+            f"Résultat : `{result}`",
+            f"Résultat prix : `{float(trade.get('result_pips', 0.0)):.8f}`",
+            ""
+        ])
+
+        if sum(len(x) + 1 for x in lines) > 3400:
+            block = "\n".join(lines[:-13])
+            if block.strip():
+                messages.append(block)
+            lines = lines[-13:]
+
+    final = "\n".join(lines)
+    if final.strip():
+        messages.append(final)
+
+    return messages
+
+
 def get_watched_pairs_message():
     """
     Affiche les quatre actifs.
@@ -833,158 +883,203 @@ def utc_now_iso():
     return datetime.utcnow().isoformat()
 
 
-def ensure_trade_history_record(
-    trade_id,
-    trade
+def _load_trade_history_list():
+    with JSON_LOCK:
+        if not os.path.exists(TRADE_HISTORY_FILE):
+            try:
+                save_json(TRADE_HISTORY_FILE, [])
+            except Exception:
+                pass
+            return []
+
+        try:
+            with open(TRADE_HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if isinstance(data, list):
+                return data
+
+            if isinstance(data, dict):
+                migrated = []
+                for trade_id, trade in data.items():
+                    if isinstance(trade, dict):
+                        item = dict(trade)
+                        item.setdefault("trade_id", str(trade_id))
+                        migrated.append(item)
+                try:
+                    save_json(TRADE_HISTORY_FILE, migrated)
+                except Exception:
+                    pass
+                return migrated
+
+        except Exception as e:
+            logging.error(f"Impossible de charger {TRADE_HISTORY_FILE}: {e}")
+
+        return []
+
+
+def add_to_trading_journal(
+    symbol,
+    direction,
+    entry_price,
+    stop_loss,
+    tp1,
+    tp2,
+    tp3,
+    rr_macro
 ):
-    """
-    Enregistre un nouveau signal dans l'historique.
+    """Enregistre un signal dans trade_history.json sans bloquer le bot."""
+    try:
+        symbol = str(symbol).strip().upper()
+        direction = str(direction).strip().upper()
+        entry_price = float(entry_price)
+        stop_loss = float(stop_loss)
+        tp1 = float(tp1)
+        tp2 = float(tp2)
+        tp3 = float(tp3)
+        rr_macro = float(rr_macro)
 
-    L'historique est conservé même lorsque le trade
-    est ensuite retiré de active_trades.json.
-    """
+        if direction == "BUY":
+            direction = "HAUSSIER"
+        elif direction == "SELL":
+            direction = "BAISSIER"
 
-    history = load_json(
-        TRADE_HISTORY_FILE
-    )
+        trade_id = f"TRD-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8].upper()}"
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    if trade_id in history:
-        return
+        record = {
+            "trade_id": trade_id,
+            "datetime": now,
+            "symbol": symbol,
+            "direction": direction,
+            "entry": entry_price,
+            "sl": stop_loss,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "rr_theory": rr_macro,
+            "status": "PENDING_LIMIT",
+            "result": "UNKNOWN",
+            "result_pips": 0.0,
+            "events": []
+        }
 
-    history[trade_id] = {
-        "trade_id": trade_id,
-        "symbol": trade.get(
-            "symbol",
-            "INCONNU"
-        ),
-        "direction": trade.get(
-            "direction",
-            "INCONNUE"
-        ),
-        "entry_price": trade.get(
-            "entry_price"
-        ),
-        "initial_sl": trade.get(
-            "initial_sl"
-        ),
-        "current_sl": trade.get(
-            "current_sl"
-        ),
-        "tp1": trade.get(
-            "tp1"
-        ),
-        "tp2": trade.get(
-            "tp2"
-        ),
-        "tp3": trade.get(
-            "tp3"
-        ),
-        "pattern": trade.get(
-            "pattern"
-        ),
-        "filter_score": trade.get(
-            "filter_score"
-        ),
-        "indicators": trade.get(
-            "indicators",
-            {}
-        ),
-        "created_at": trade.get(
-            "created_at",
-            utc_now_iso()
-        ),
-        "status": "ACTIVE",
-        "result": None,
-        "closed_at": None,
-        "close_price": None,
-        "events": []
-    }
+        with JSON_LOCK:
+            history = _load_trade_history_list()
+            history.append(record)
+            save_json(TRADE_HISTORY_FILE, history)
 
-    save_json(
-        TRADE_HISTORY_FILE,
-        history
-    )
+        return trade_id
+
+    except Exception as e:
+        logging.error(f"Erreur journal trading : {e}")
+        return None
 
 
-def record_trade_event(
-    trade_id,
-    event,
-    price=None
-):
-    """
-    Enregistre un événement du cycle de vie du signal.
-    """
-
-    history = load_json(
-        TRADE_HISTORY_FILE
-    )
-
-    if trade_id not in history:
-        return
-
-    event_data = {
-        "event": event,
-        "timestamp": utc_now_iso()
-    }
-
-    if price is not None:
-        event_data["price"] = price
-
-    history[trade_id].setdefault(
-        "events",
-        []
-    )
-
-    history[trade_id]["events"].append(
-        event_data
-    )
-
-    save_json(
-        TRADE_HISTORY_FILE,
-        history
-    )
+def _find_trade_history_record(history, trade_id):
+    trade_id = str(trade_id)
+    for trade in history:
+        if str(trade.get("trade_id")) == trade_id:
+            return trade
+    return None
 
 
-def close_trade_in_history(
-    trade_id,
-    result,
-    close_price
-):
-    """
-    Enregistre définitivement le résultat d'un trade.
-    """
-
-    history = load_json(
-        TRADE_HISTORY_FILE
-    )
-
-    if trade_id not in history:
-        logging.warning(
-            f"Historique absent pour "
-            f"le trade {trade_id}."
+def ensure_trade_history_record(trade_id, trade):
+    try:
+        direction = "HAUSSIER" if trade.get("direction") == "BUY" else "BAISSIER"
+        journal_id = add_to_trading_journal(
+            symbol=trade.get("symbol", "INCONNU"),
+            direction=direction,
+            entry_price=trade.get("entry_price", 0.0),
+            stop_loss=trade.get("initial_sl", trade.get("current_sl", 0.0)),
+            tp1=trade.get("tp1", 0.0),
+            tp2=trade.get("tp2", 0.0),
+            tp3=trade.get("tp3", 0.0),
+            rr_macro=trade.get("rr_theoretical", 0.0)
         )
-        return
 
-    history[trade_id]["status"] = "CLOSED"
-    history[trade_id]["result"] = result
-    history[trade_id]["close_price"] = close_price
-    history[trade_id]["closed_at"] = utc_now_iso()
+        if journal_id is None:
+            return
 
-    history[trade_id].setdefault(
-        "events",
-        []
-    )
+        with JSON_LOCK:
+            history = _load_trade_history_list()
+            record = _find_trade_history_record(history, journal_id)
+            if record is not None:
+                record["trade_id"] = trade_id
+                record["created_at"] = trade.get("created_at", utc_now_iso())
+                record["current_sl"] = trade.get("current_sl", trade.get("initial_sl"))
+                record["pattern"] = trade.get("pattern")
+                record["filter_score"] = trade.get("filter_score")
+                record["indicators"] = trade.get("indicators", {})
+                record["active_trade_id"] = trade_id
+                save_json(TRADE_HISTORY_FILE, history)
 
-    history[trade_id]["events"].append({
-        "event": result,
-        "timestamp": utc_now_iso(),
-        "price": close_price
-    })
+    except Exception as e:
+        logging.error(f"Erreur création journal pour {trade_id}: {e}")
 
-    save_json(
-        TRADE_HISTORY_FILE,
-        history
-    )
+
+def record_trade_event(trade_id, event, price=None):
+    try:
+        with JSON_LOCK:
+            history = _load_trade_history_list()
+            trade = _find_trade_history_record(history, trade_id)
+            if trade is None:
+                return
+
+            event_data = {
+                "event": event,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            }
+            if price is not None:
+                event_data["price"] = float(price)
+
+            trade.setdefault("events", []).append(event_data)
+
+            if event == "LIMIT_FILLED":
+                trade["status"] = "ACTIVE"
+            elif event == "TP1_HIT":
+                trade["tp1_hit"] = True
+            elif event == "TP2_HIT":
+                trade["tp2_hit"] = True
+            elif event == "TP3_HIT":
+                trade["tp3_hit"] = True
+
+            save_json(TRADE_HISTORY_FILE, history)
+
+    except Exception as e:
+        logging.error(f"Erreur événement journal {trade_id}: {e}")
+
+
+def close_trade_in_history(trade_id, result, close_price):
+    try:
+        with JSON_LOCK:
+            history = _load_trade_history_list()
+            trade = _find_trade_history_record(history, trade_id)
+            if trade is None:
+                logging.warning(f"Historique absent pour le trade {trade_id}.")
+                return
+
+            trade["status"] = "CLOSED"
+            trade["result"] = str(result)
+            trade["close_price"] = float(close_price)
+            trade["closed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            entry = float(trade.get("entry", 0.0))
+            direction = trade.get("direction", "")
+            if direction == "HAUSSIER":
+                trade["result_pips"] = float(close_price - entry)
+            else:
+                trade["result_pips"] = float(entry - close_price)
+
+            trade.setdefault("events", []).append({
+                "event": str(result),
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "price": float(close_price)
+            })
+            save_json(TRADE_HISTORY_FILE, history)
+
+    except Exception as e:
+        logging.error(f"Erreur clôture journal {trade_id}: {e}")
 
 
 def get_statistics(
@@ -1001,9 +1096,7 @@ def get_statistics(
     de clôture.
     """
 
-    history = load_json(
-        TRADE_HISTORY_FILE
-    )
+    history = _load_trade_history_list()
 
     statistics = {
         "signals_generated": 0,
@@ -1021,7 +1114,9 @@ def get_statistics(
         "trades": []
     }
 
-    for trade_id, trade in history.items():
+    for trade in history:
+
+        trade_id = trade.get("trade_id")
 
         try:
 
@@ -1107,13 +1202,13 @@ def get_statistics(
                     "direction"
                 )
 
-                if direction == "BUY":
+                if direction in ("BUY", "HAUSSIER"):
 
                     statistics[
                         "buy_signals"
                     ] += 1
 
-                elif direction == "SELL":
+                elif direction in ("SELL", "BAISSIER"):
 
                     statistics[
                         "sell_signals"
@@ -1562,6 +1657,14 @@ def handle_telegram_callback(
             text = (
                 get_all_time_statistics_message()
             )
+
+        elif data == "journal":
+
+            journal_messages = get_trading_journal_messages()
+            text = journal_messages[0]
+
+            for extra_message in journal_messages[1:]:
+                send_telegram_owner_message(extra_message, reply_markup=telegram_menu_keyboard())
 
         elif data == "bot_status":
 
