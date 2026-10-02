@@ -1,9 +1,10 @@
 import os
 import time
+import json
 import logging
 import threading
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,60 +16,104 @@ import yfinance as yf
 # CONFIGURATION
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+# Nettoyage automatique des espaces, retours ligne et espaces
+# invisibles provenant des variables Railway.
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN", ""
+).strip().replace("\r", "").replace("\n", "")
 
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID", ""
+).strip().replace("\r", "").replace("\n", "")
 
+TELEGRAM_ADMIN_ID = os.getenv(
+    "TELEGRAM_ADMIN_ID", ""
+).strip().replace("\r", "").replace("\n", "")
+
+# BIQUOTE peut être configuré sans rendre cette variable obligatoire.
 BIQUOTE_BASE_URL = os.getenv(
     "BIQUOTE_BASE_URL",
     "https://biquote.io/api"
-).rstrip("/")
+).strip().rstrip("/")
 
-SCAN_INTERVAL_SECONDS = 300
-TIMEFRAME = "5m"
-LOOKBACK_CANDLES = 150
+# Clés facultatives pour les sources de secours.
+ALPHA_VANTAGE_API_KEY = os.getenv(
+    "ALPHA_VANTAGE_API_KEY",
+    ""
+).strip()
 
-SYMBOLS = [
-    "XAUUSD",
-    "BTCUSD",
-    "GBPUSD",
-    "EURUSD",
-]
+TWELVE_DATA_API_KEY = os.getenv(
+    "TWELVE_DATA_API_KEY",
+    ""
+).strip()
+
+
+# ============================================================
+# PARAMÈTRES DU BOT
+# ============================================================
+
+SCAN_INTERVAL_SECONDS = 60
+
+M15_CANDLES = 150
+M5_CANDLES = 150
+M1_CANDLES = 180
+
+CHOC_LOOKBACK = 15
+SMV_LOOKBACK = 20
+
+SIGNAL_COOLDOWN_MINUTES = 60
+PENDING_ORDER_TIMEOUT_MINUTES = 15
+
+BE_TRIGGER_RR = 1.5
+
+TP1_RR = 3.0
+TP2_RR = 6.0
+
+
+# ============================================================
+# ACTIFS
+# ============================================================
 
 ASSETS = {
     "XAUUSD": {
         "yahoo": "GC=F",
+        "decimals": 2,
+        "buffer": 1.5,
+        "pip": 0.10,
         "alpha_from": "XAU",
         "alpha_to": "USD",
         "twelve": "XAU/USD",
-        "decimals": 2,
     },
     "BTCUSD": {
         "yahoo": "BTC-USD",
-        "coingecko": "bitcoin",
+        "decimals": 2,
+        "buffer": 50.0,
+        "pip": 1.0,
         "alpha_from": "BTC",
         "alpha_to": "USD",
         "twelve": "BTC/USD",
-        "decimals": 2,
     },
     "GBPUSD": {
         "yahoo": "GBPUSD=X",
+        "decimals": 5,
+        "buffer": 0.00030,
+        "pip": 0.00001,
         "alpha_from": "GBP",
         "alpha_to": "USD",
         "twelve": "GBP/USD",
-        "decimals": 5,
     },
     "EURUSD": {
         "yahoo": "EURUSD=X",
+        "decimals": 5,
+        "buffer": 0.00030,
+        "pip": 0.00001,
         "alpha_from": "EUR",
         "alpha_to": "USD",
         "twelve": "EUR/USD",
-        "decimals": 5,
     },
 }
+
+SYMBOLS = list(ASSETS.keys())
 
 
 # ============================================================
@@ -80,64 +125,71 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("TRADING_BOT")
+logger = logging.getLogger("NOVA-MTF-BOT")
 
 
 # ============================================================
-# GLOBAL STATE
+# HTTP SESSION
 # ============================================================
 
 session = requests.Session()
+
 session.headers.update(
     {
-        "User-Agent": "NOVA-TRADING-BOT/1.0",
+        "User-Agent": "NOVA-MTF-TRADING-BOT/1.0",
         "Accept": "application/json",
     }
 )
 
-state_lock = threading.Lock()
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+TELEGRAM_API_URL = (
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+)
+
+
+# ============================================================
+# ÉTAT GLOBAL
+# ============================================================
+
+state_lock = threading.RLock()
 scan_lock = threading.Lock()
 
 last_prices: Dict[str, Dict[str, Any]] = {}
-last_signals: Dict[str, Dict[str, Any]] = {}
 
-bot_started_at = datetime.now(timezone.utc)
+cooldown_tracker: Dict[str, datetime] = {}
+
+pending_orders: Dict[str, Dict[str, Any]] = {}
+
+closed_setups: Dict[str, Dict[str, Any]] = {}
+
 last_scan_at: Optional[datetime] = None
 last_scan_duration = 0.0
+
 total_scans = 0
 total_signals = 0
 
+bot_started_at = datetime.now(timezone.utc)
+
 telegram_offset = 0
+
 telegram_running = True
+
 scan_in_progress = False
 
 
 # ============================================================
-# VALIDATION ENVIRONMENT
+# FICHIER DE PERSISTANCE
 # ============================================================
 
-def validate_environment() -> None:
-    missing = []
-
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-
-    if not TELEGRAM_ADMIN_ID:
-        missing.append("TELEGRAM_ADMIN_ID")
-
-    if missing:
-        raise RuntimeError(
-            "Variables Railway manquantes : " + ", ".join(missing)
-        )
-
-    logger.info("Variables Telegram correctement configurées.")
+STATE_FILE = "trade_state.json"
 
 
 # ============================================================
-# UTILS
+# OUTILS
 # ============================================================
 
 def utc_now() -> datetime:
@@ -160,67 +212,296 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
-def format_price(symbol: str, price: Any) -> str:
-    value = safe_float(price)
+def format_price(
+    symbol: str,
+    value: Any,
+) -> str:
 
-    if value is None:
+    number = safe_float(value)
+
+    if number is None:
         return "N/A"
 
     decimals = ASSETS[symbol]["decimals"]
 
-    return f"{value:.{decimals}f}"
+    return f"{number:.{decimals}f}"
 
 
-def format_volume(volume: Any) -> str:
-    value = safe_float(volume)
+def format_volume(value: Any) -> str:
+
+    number = safe_float(value)
+
+    if number is None:
+        return "N/A"
+
+    if abs(number) >= 1_000_000:
+        return f"{number:,.0f}"
+
+    if abs(number) >= 1_000:
+        return f"{number:,.2f}"
+
+    return f"{number:.2f}"
+
+
+def iso_datetime(value: Optional[datetime]) -> str:
 
     if value is None:
         return "N/A"
 
-    if abs(value) >= 1_000_000:
-        return f"{value:,.0f}"
-
-    if abs(value) >= 1_000:
-        return f"{value:,.2f}"
-
-    return f"{value:.2f}"
+    return value.astimezone(timezone.utc).isoformat()
 
 
 # ============================================================
-# DATAFRAME NORMALIZATION
+# PERSISTANCE
+# ============================================================
+
+def serialize_state() -> Dict[str, Any]:
+
+    with state_lock:
+
+        cooldowns = {
+            symbol: timestamp.isoformat()
+            for symbol, timestamp in cooldown_tracker.items()
+        }
+
+        orders = {}
+
+        for symbol, order in pending_orders.items():
+
+            serialized = dict(order)
+
+            for key in [
+                "created_at",
+                "last_update",
+                "expires_at",
+            ]:
+
+                if isinstance(
+                    serialized.get(key),
+                    datetime,
+                ):
+
+                    serialized[key] = (
+                        serialized[key].isoformat()
+                    )
+
+            orders[symbol] = serialized
+
+        return {
+            "cooldown_tracker": cooldowns,
+            "pending_orders": orders,
+            "closed_setups": closed_setups,
+        }
+
+
+def save_state() -> None:
+
+    try:
+
+        data = serialize_state()
+
+        temporary_file = STATE_FILE + ".tmp"
+
+        with open(
+            temporary_file,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        os.replace(
+            temporary_file,
+            STATE_FILE,
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Impossible de sauvegarder l'état : %s",
+            exc,
+        )
+
+
+def load_state() -> None:
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+
+            data = json.load(file)
+
+        with state_lock:
+
+            for symbol, value in data.get(
+                "cooldown_tracker",
+                {},
+            ).items():
+
+                try:
+
+                    cooldown_tracker[symbol] = (
+                        datetime.fromisoformat(value)
+                    )
+
+                except Exception:
+                    pass
+
+            for symbol, order in data.get(
+                "pending_orders",
+                {},
+            ).items():
+
+                restored = dict(order)
+
+                for key in [
+                    "created_at",
+                    "last_update",
+                    "expires_at",
+                ]:
+
+                    if restored.get(key):
+
+                        try:
+
+                            restored[key] = (
+                                datetime.fromisoformat(
+                                    restored[key]
+                                )
+                            )
+
+                        except Exception:
+                            pass
+
+                pending_orders[symbol] = restored
+
+            closed_setups.update(
+                data.get(
+                    "closed_setups",
+                    {},
+                )
+            )
+
+        logger.info(
+            "État précédent restauré depuis %s.",
+            STATE_FILE,
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Impossible de restaurer l'état : %s",
+            exc,
+        )
+
+
+# ============================================================
+# VALIDATION ENVIRONNEMENT
+# ============================================================
+
+def validate_environment() -> None:
+
+    missing = []
+
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+
+    if not TELEGRAM_ADMIN_ID:
+        missing.append("TELEGRAM_ADMIN_ID")
+
+    if missing:
+
+        raise RuntimeError(
+            "Variables Railway manquantes : "
+            + ", ".join(missing)
+        )
+
+    try:
+        int(TELEGRAM_ADMIN_ID)
+
+    except ValueError:
+
+        raise RuntimeError(
+            "TELEGRAM_ADMIN_ID doit être un identifiant numérique."
+        )
+
+    logger.info(
+        "Variables Telegram validées."
+    )
+
+
+# ============================================================
+# NORMALISATION DATAFRAME
 # ============================================================
 
 def normalize_dataframe(
     df: pd.DataFrame,
-    limit: int = LOOKBACK_CANDLES,
+    limit: int,
 ) -> pd.DataFrame:
 
     if df is None or df.empty:
-        raise ValueError("DataFrame vide.")
+        raise ValueError(
+            "DataFrame vide."
+        )
 
     df = df.copy()
 
-    # Gestion Yahoo MultiIndex
-    if isinstance(df.columns, pd.MultiIndex):
+    # --------------------------------------------------------
+    # MultiIndex Yahoo
+    # --------------------------------------------------------
+
+    if isinstance(
+        df.columns,
+        pd.MultiIndex,
+    ):
+
         flattened = []
 
         for column in df.columns:
+
             parts = [
                 str(part)
                 for part in column
-                if str(part).lower() not in ("", "nan", "none")
+                if str(part).lower()
+                not in (
+                    "",
+                    "nan",
+                    "none",
+                )
             ]
 
-            if parts:
-                flattened.append(parts[0])
-            else:
-                flattened.append("")
+            flattened.append(
+                parts[0]
+                if parts
+                else ""
+            )
 
         df.columns = flattened
 
-    # Normalisation noms colonnes
+    # --------------------------------------------------------
+    # Colonnes minuscules
+    # --------------------------------------------------------
+
     df.columns = [
-        str(column).strip().lower().replace("_", " ")
+        str(column)
+        .strip()
+        .lower()
+        .replace("_", " ")
         for column in df.columns
     ]
 
@@ -234,19 +515,29 @@ def normalize_dataframe(
         "tick volume": "tickvolume",
     }
 
-    df = df.rename(columns=rename_map)
+    df.rename(
+        columns=rename_map,
+        inplace=True,
+    )
 
-    # Suppression des colonnes dupliquées
-    df = df.loc[:, ~df.columns.duplicated()]
+    df = df.loc[
+        :,
+        ~df.columns.duplicated(),
+    ]
 
-    # Colonnes obligatoires
-    for column in ["open", "high", "low", "close"]:
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]:
+
         if column not in df.columns:
+
             raise ValueError(
-                f"Colonne obligatoire absente : {column}"
+                f"Colonne absente : {column}"
             )
 
-    # Volume
     if "volume" not in df.columns:
         df["volume"] = np.nan
 
@@ -261,21 +552,36 @@ def normalize_dataframe(
         "volume",
         "tickvolume",
     ]:
+
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce",
         )
 
-    # Si volume réel indisponible, utiliser tick volume
-    volume = df["volume"].copy()
+    # Si le fournisseur donne uniquement le tick volume.
+    if (
+        df["volume"].isna().all()
+        or df["volume"].fillna(0).sum() == 0
+    ):
 
-    if volume.notna().sum() == 0 or volume.fillna(0).sum() == 0:
-        volume = df["tickvolume"].copy()
+        if (
+            not df["tickvolume"].isna().all()
+            and df["tickvolume"].fillna(0).sum() > 0
+        ):
 
-    df["volume"] = volume
+            df["volume"] = df[
+                "tickvolume"
+            ]
 
-    # Index temporel
-    if not isinstance(df.index, pd.DatetimeIndex):
+    # --------------------------------------------------------
+    # INDEX TEMPOREL
+    # --------------------------------------------------------
+
+    if not isinstance(
+        df.index,
+        pd.DatetimeIndex,
+    ):
+
         df.index = pd.to_datetime(
             df.index,
             errors="coerce",
@@ -283,180 +589,398 @@ def normalize_dataframe(
         )
 
     else:
+
         try:
+
             if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC")
+
+                df.index = df.index.tz_localize(
+                    "UTC"
+                )
+
             else:
-                df.index = df.index.tz_convert("UTC")
+
+                df.index = df.index.tz_convert(
+                    "UTC"
+                )
+
         except Exception:
+
             df.index = pd.to_datetime(
                 df.index,
                 errors="coerce",
                 utc=True,
             )
 
-    df = df[~df.index.isna()]
+    df = df[
+        ~df.index.isna()
+    ]
+
     df = df.sort_index()
 
-    # Nettoyage OHLC
     df = df.dropna(
-        subset=["open", "high", "low", "close"]
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
     )
 
     return df.tail(limit)
 
 
 # ============================================================
-# BIQUOTE - SOURCE PRINCIPALE
+# BIQUOTE
 # ============================================================
 
-def fetch_biquote_ohlc(
-    symbol: str,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _biquote_extract_bars(
+    payload: Any,
+) -> List[Dict[str, Any]]:
 
-    url = f"{BIQUOTE_BASE_URL}/{symbol}/ohlc"
+    if isinstance(
+        payload,
+        list,
+    ):
 
-    response = session.get(
-        url,
-        params={
-            "interval": TIMEFRAME,
-            "limit": LOOKBACK_CANDLES,
-        },
-        timeout=12,
+        return payload
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+
+        return []
+
+    for key in [
+        "bars",
+        "data",
+        "candles",
+        "results",
+        "items",
+    ]:
+
+        value = payload.get(key)
+
+        if isinstance(
+            value,
+            list,
+        ):
+
+            return value
+
+    return []
+
+
+def _biquote_bar_to_row(
+    bar: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+
+    timestamp = (
+        bar.get("openTime")
+        or bar.get("open_time")
+        or bar.get("timestamp")
+        or bar.get("time")
+        or bar.get("datetime")
+        or bar.get("date")
     )
 
-    response.raise_for_status()
-
-    payload = response.json()
-
-    if not isinstance(payload, dict):
-        raise ValueError("Réponse BIQUOTE invalide.")
-
-    bars = payload.get("bars")
-
-    if not isinstance(bars, list) or not bars:
-        raise ValueError(
-            f"Aucune bougie BIQUOTE pour {symbol}."
-        )
-
-    rows = []
-
-    for bar in bars:
-        if not isinstance(bar, dict):
-            continue
-
-        rows.append(
-            {
-                "openTime": bar.get("openTime"),
-                "open": bar.get("open"),
-                "high": bar.get("high"),
-                "low": bar.get("low"),
-                "close": bar.get("close"),
-                "volume": bar.get("volume"),
-                "tickVolume": bar.get("tickVolume"),
-                "isOpen": bar.get("isOpen", False),
-            }
-        )
-
-    if not rows:
-        raise ValueError(
-            f"Barres BIQUOTE invalides pour {symbol}."
-        )
-
-    df = pd.DataFrame(rows)
-
-    df["openTime"] = pd.to_datetime(
-        df["openTime"],
-        errors="coerce",
-        utc=True,
+    open_price = (
+        bar.get("open")
+        or bar.get("o")
     )
 
-    df = df.set_index("openTime")
-
-    df = normalize_dataframe(
-        df,
-        limit=LOOKBACK_CANDLES,
+    high = (
+        bar.get("high")
+        or bar.get("h")
     )
 
-    # Le moteur de stratégie travaille uniquement
-    # sur les bougies clôturées.
-    if "isOpen" in df.columns:
-        closed_mask = ~df["isOpen"].fillna(False).astype(bool)
-
-        closed_df = df.loc[closed_mask].copy()
-
-        if len(closed_df) >= 30:
-            df = closed_df
-
-    # Tick live pour le prix affiché
-    tick_url = f"{BIQUOTE_BASE_URL}/{symbol}"
-
-    tick_response = session.get(
-        tick_url,
-        params={"allowStale": "false"},
-        timeout=8,
+    low = (
+        bar.get("low")
+        or bar.get("l")
     )
 
-    tick_response.raise_for_status()
-
-    tick = tick_response.json()
-
-    if not isinstance(tick, dict):
-        raise ValueError(
-            f"Tick BIQUOTE invalide pour {symbol}."
-        )
-
-    price = (
-        safe_float(tick.get("mid"))
-        or safe_float(tick.get("last"))
-        or safe_float(tick.get("bid"))
-        or safe_float(tick.get("ask"))
+    close = (
+        bar.get("close")
+        or bar.get("c")
     )
 
-    if price is None:
-        raise ValueError(
-            f"Prix BIQUOTE indisponible pour {symbol}."
-        )
+    volume = (
+        bar.get("volume")
+        or bar.get("v")
+        or bar.get("tickVolume")
+        or bar.get("tick_volume")
+    )
 
-    # Volume de marché si disponible.
-    # Pour FX/CFD BIQUOTE expose généralement 0 en volume
-    # et fournit tickVolume sur les bougies.
-    live_volume = safe_float(tick.get("volume"))
+    if (
+        timestamp is None
+        or open_price is None
+        or high is None
+        or low is None
+        or close is None
+    ):
 
-    if live_volume is None or live_volume == 0:
-        if not df.empty:
-            live_volume = safe_float(
-                df.iloc[-1].get("volume")
-            )
+        return None
 
-    metadata = {
-        "source": "BIQUOTE",
-        "price": price,
-        "volume": live_volume,
-        "timestamp": tick.get("timestamp"),
-        "market_state": tick.get("marketState"),
-        "stale": tick.get("stale"),
-        "quote_age": tick.get("quoteAgeSeconds"),
+    return {
+        "timestamp": timestamp,
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
     }
 
-    return df, metadata
 
-
-# ============================================================
-# YAHOO FINANCE - SECOURS 1
-# ============================================================
-
-def fetch_yahoo(
+def fetch_biquote_timeframe(
     symbol: str,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    timeframe: str,
+    limit: int,
+) -> pd.DataFrame:
 
-    yahoo_symbol = ASSETS[symbol]["yahoo"]
+    # Plusieurs chemins sont essayés afin de rester compatible
+    # avec les variantes publiques d'API BIQUOTE.
+    paths = [
+        f"/{symbol}/ohlc",
+        f"/ohlc/{symbol}",
+        f"/market/{symbol}/ohlc",
+        f"/markets/{symbol}/ohlc",
+    ]
 
-    ticker = yf.Ticker(yahoo_symbol)
+    last_error = None
+
+    for path in paths:
+
+        try:
+
+            url = (
+                BIQUOTE_BASE_URL
+                + path
+            )
+
+            response = session.get(
+                url,
+                params={
+                    "interval": timeframe,
+                    "timeframe": timeframe,
+                    "limit": limit,
+                    "count": limit,
+                },
+                timeout=12,
+            )
+
+            if response.status_code != 200:
+
+                last_error = (
+                    f"HTTP {response.status_code}"
+                )
+
+                continue
+
+            payload = response.json()
+
+            bars = _biquote_extract_bars(
+                payload
+            )
+
+            if not bars:
+
+                last_error = (
+                    "Aucune barre dans la réponse."
+                )
+
+                continue
+
+            rows = []
+
+            for bar in bars:
+
+                if not isinstance(
+                    bar,
+                    dict,
+                ):
+                    continue
+
+                row = _biquote_bar_to_row(
+                    bar
+                )
+
+                if row:
+                    rows.append(row)
+
+            if not rows:
+
+                last_error = (
+                    "Barres BIQUOTE invalides."
+                )
+
+                continue
+
+            df = pd.DataFrame(rows)
+
+            df["timestamp"] = pd.to_datetime(
+                df["timestamp"],
+                errors="coerce",
+                utc=True,
+            )
+
+            df = df.set_index(
+                "timestamp"
+            )
+
+            df = normalize_dataframe(
+                df,
+                limit,
+            )
+
+            if len(df) >= 30:
+                return df
+
+            last_error = (
+                "Pas assez de bougies."
+            )
+
+        except Exception as exc:
+
+            last_error = str(exc)
+
+    raise RuntimeError(
+        f"BIQUOTE {symbol} {timeframe} : "
+        f"{last_error}"
+    )
+
+
+def fetch_biquote_live_price(
+    symbol: str,
+) -> Optional[float]:
+
+    paths = [
+        f"/{symbol}",
+        f"/quote/{symbol}",
+        f"/market/{symbol}",
+        f"/markets/{symbol}",
+    ]
+
+    for path in paths:
+
+        try:
+
+            response = session.get(
+                BIQUOTE_BASE_URL + path,
+                params={
+                    "allowStale": "false",
+                },
+                timeout=8,
+            )
+
+            if response.status_code != 200:
+                continue
+
+            payload = response.json()
+
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                continue
+
+            for key in [
+                "mid",
+                "last",
+                "price",
+                "close",
+                "bid",
+                "ask",
+            ]:
+
+                price = safe_float(
+                    payload.get(key)
+                )
+
+                if price is not None:
+                    return price
+
+        except Exception:
+            continue
+
+    return None
+
+
+def fetch_biquote_all_timeframes(
+    symbol: str,
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    Dict[str, Any],
+]:
+
+    m15 = fetch_biquote_timeframe(
+        symbol,
+        "15m",
+        M15_CANDLES,
+    )
+
+    m5 = fetch_biquote_timeframe(
+        symbol,
+        "5m",
+        M5_CANDLES,
+    )
+
+    m1 = fetch_biquote_timeframe(
+        symbol,
+        "1m",
+        M1_CANDLES,
+    )
+
+    live_price = (
+        fetch_biquote_live_price(symbol)
+    )
+
+    if live_price is None:
+
+        live_price = safe_float(
+            m1.iloc[-1]["close"]
+        )
+
+    return (
+        m15,
+        m5,
+        m1,
+        {
+            "source": "BIQUOTE",
+            "price": live_price,
+            "m15_price": safe_float(
+                m15.iloc[-1]["close"]
+            ),
+            "m5_price": safe_float(
+                m5.iloc[-1]["close"]
+            ),
+            "m1_price": safe_float(
+                m1.iloc[-1]["close"]
+            ),
+            "m1_volume": safe_float(
+                m1.iloc[-1]["volume"]
+            ),
+        },
+    )
+
+
+# ============================================================
+# YAHOO
+# ============================================================
+
+def fetch_yahoo_1m(
+    symbol: str,
+) -> pd.DataFrame:
+
+    ticker = yf.Ticker(
+        ASSETS[symbol]["yahoo"]
+    )
 
     df = ticker.history(
-        period="5d",
-        interval="5m",
+        period="7d",
+        interval="1m",
         auto_adjust=False,
         actions=False,
         prepost=False,
@@ -464,44 +988,117 @@ def fetch_yahoo(
 
     df = normalize_dataframe(
         df,
-        limit=LOOKBACK_CANDLES,
+        M1_CANDLES,
     )
 
     if len(df) < 30:
-        raise ValueError(
-            f"Pas assez de données Yahoo pour {symbol}."
+
+        raise RuntimeError(
+            f"Yahoo : données 1m insuffisantes pour {symbol}."
         )
 
-    latest = df.iloc[-1]
+    return df
 
-    price = safe_float(latest["close"])
-    volume = safe_float(latest["volume"])
 
-    if price is None:
+def resample_ohlcv(
+    df: pd.DataFrame,
+    rule: str,
+    limit: int,
+) -> pd.DataFrame:
+
+    if df.empty:
         raise ValueError(
-            f"Prix Yahoo indisponible pour {symbol}."
+            "DataFrame vide pour resampling."
         )
 
-    return df, {
-        "source": "Yahoo",
-        "price": price,
-        "volume": volume,
-        "timestamp": str(df.index[-1]),
-    }
+    aggregated = df.resample(
+        rule,
+        label="right",
+        closed="right",
+    ).agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+    )
+
+    aggregated = aggregated.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+    )
+
+    return normalize_dataframe(
+        aggregated,
+        limit,
+    )
 
 
-# ============================================================
-# COINGECKO - SECOURS BTC
-# ============================================================
-
-def fetch_coingecko(
+def fetch_yahoo_all_timeframes(
     symbol: str,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    Dict[str, Any],
+]:
 
-    if symbol != "BTCUSD":
-        raise ValueError(
-            "CoinGecko uniquement disponible pour BTCUSD."
-        )
+    base = fetch_yahoo_1m(
+        symbol
+    )
+
+    m1 = base.tail(
+        M1_CANDLES
+    )
+
+    m5 = resample_ohlcv(
+        base,
+        "5min",
+        M5_CANDLES,
+    )
+
+    m15 = resample_ohlcv(
+        base,
+        "15min",
+        M15_CANDLES,
+    )
+
+    price = safe_float(
+        m1.iloc[-1]["close"]
+    )
+
+    return (
+        m15,
+        m5,
+        m1,
+        {
+            "source": "Yahoo",
+            "price": price,
+            "m15_price": safe_float(
+                m15.iloc[-1]["close"]
+            ),
+            "m5_price": safe_float(
+                m5.iloc[-1]["close"]
+            ),
+            "m1_price": price,
+            "m1_volume": safe_float(
+                m1.iloc[-1]["volume"]
+            ),
+        },
+    )
+
+
+# ============================================================
+# COINGECKO BTC - SECOURS SUPPLÉMENTAIRE
+# ============================================================
+
+def fetch_coingecko_btc() -> pd.DataFrame:
 
     url = (
         "https://api.coingecko.com/api/v3/"
@@ -514,24 +1111,35 @@ def fetch_coingecko(
             "vs_currency": "usd",
             "days": "1",
         },
-        timeout=12,
+        timeout=15,
     )
 
     response.raise_for_status()
 
     payload = response.json()
 
-    prices = payload.get("prices", [])
-    volumes = payload.get("total_volumes", [])
+    prices = payload.get(
+        "prices",
+        [],
+    )
+
+    volumes = payload.get(
+        "total_volumes",
+        [],
+    )
 
     if len(prices) < 30:
-        raise ValueError(
-            "Pas assez de données CoinGecko."
+
+        raise RuntimeError(
+            "CoinGecko BTC : données insuffisantes."
         )
 
     price_df = pd.DataFrame(
         prices,
-        columns=["timestamp", "price"],
+        columns=[
+            "timestamp",
+            "price",
+        ],
     )
 
     price_df["timestamp"] = pd.to_datetime(
@@ -540,7 +1148,9 @@ def fetch_coingecko(
         utc=True,
     )
 
-    price_df = price_df.set_index("timestamp")
+    price_df = price_df.set_index(
+        "timestamp"
+    )
 
     price_df["open"] = price_df["price"]
     price_df["high"] = price_df["price"]
@@ -548,9 +1158,13 @@ def fetch_coingecko(
     price_df["close"] = price_df["price"]
 
     if volumes:
+
         volume_df = pd.DataFrame(
             volumes,
-            columns=["timestamp", "volume"],
+            columns=[
+                "timestamp",
+                "volume",
+            ],
         )
 
         volume_df["timestamp"] = pd.to_datetime(
@@ -559,16 +1173,23 @@ def fetch_coingecko(
             utc=True,
         )
 
-        volume_df = volume_df.set_index("timestamp")
-
-        price_df["volume"] = volume_df["volume"].reindex(
-            price_df.index,
-            method="nearest",
+        volume_df = volume_df.set_index(
+            "timestamp"
         )
+
+        price_df["volume"] = (
+            volume_df["volume"]
+            .reindex(
+                price_df.index,
+                method="nearest",
+            )
+        )
+
     else:
+
         price_df["volume"] = np.nan
 
-    price_df = price_df[
+    base = price_df[
         [
             "open",
             "high",
@@ -578,195 +1199,318 @@ def fetch_coingecko(
         ]
     ]
 
-    # Agrégation 5 minutes
-    df = price_df.resample("5min").agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }
-    ).dropna(subset=["open", "high", "low", "close"])
-
-    df = normalize_dataframe(
-        df,
-        limit=LOOKBACK_CANDLES,
+    m1 = resample_ohlcv(
+        base,
+        "1min",
+        M1_CANDLES,
     )
 
-    if len(df) < 30:
-        raise ValueError(
-            "Pas assez de bougies CoinGecko."
-        )
+    m5 = resample_ohlcv(
+        base,
+        "5min",
+        M5_CANDLES,
+    )
 
-    price = safe_float(df.iloc[-1]["close"])
-    volume = safe_float(df.iloc[-1]["volume"])
+    m15 = resample_ohlcv(
+        base,
+        "15min",
+        M15_CANDLES,
+    )
 
-    return df, {
-        "source": "CoinGecko",
-        "price": price,
-        "volume": volume,
-        "timestamp": str(df.index[-1]),
-    }
+    return m15, m5, m1
 
 
 # ============================================================
-# ALPHA VANTAGE - SECOURS 3
+# CASCADE
 # ============================================================
 
-def fetch_alpha_vantage(
+def get_market_data(
     symbol: str,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+) -> Tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    Dict[str, Any],
+]:
 
-    if not ALPHA_VANTAGE_API_KEY:
-        raise ValueError(
-            "ALPHA_VANTAGE_API_KEY non configurée."
+    # --------------------------------------------------------
+    # SOURCE 1 : BIQUOTE
+    # --------------------------------------------------------
+
+    try:
+
+        result = fetch_biquote_all_timeframes(
+            symbol
         )
+
+        metadata = result[3]
+
+        logger.info(
+            "| [BIQUOTE OK] %s | M15: %s | M5: %s | M1: %s",
+            symbol,
+            format_price(
+                symbol,
+                metadata["m15_price"],
+            ),
+            format_price(
+                symbol,
+                metadata["m5_price"],
+            ),
+            format_price(
+                symbol,
+                metadata["m1_price"],
+            ),
+        )
+
+        return result
+
+    except Exception as exc:
+
+        logger.warning(
+            "[BIQUOTE] %s indisponible : %s",
+            symbol,
+            exc,
+        )
+
+    # --------------------------------------------------------
+    # SOURCE 2 : YAHOO
+    # --------------------------------------------------------
+
+    try:
+
+        result = fetch_yahoo_all_timeframes(
+            symbol
+        )
+
+        metadata = result[3]
+
+        logger.info(
+            "| [YAHOO OK] %s | M15: %s | M5: %s | M1: %s",
+            symbol,
+            format_price(
+                symbol,
+                metadata["m15_price"],
+            ),
+            format_price(
+                symbol,
+                metadata["m5_price"],
+            ),
+            format_price(
+                symbol,
+                metadata["m1_price"],
+            ),
+        )
+
+        return result
+
+    except Exception as exc:
+
+        logger.warning(
+            "[YAHOO] %s indisponible : %s",
+            symbol,
+            exc,
+        )
+
+    # --------------------------------------------------------
+    # SOURCE 3 : COINGECKO BTC
+    # --------------------------------------------------------
 
     if symbol == "BTCUSD":
 
-        url = "https://www.alphavantage.co/query"
+        try:
 
-        response = session.get(
-            url,
-            params={
-                "function": "CRYPTO_INTRADAY",
-                "symbol": "BTC",
-                "market": "USD",
-                "interval": "5min",
-                "outputsize": "full",
-                "apikey": ALPHA_VANTAGE_API_KEY,
-            },
-            timeout=15,
-        )
-
-        response.raise_for_status()
-
-        payload = response.json()
-
-        series = payload.get(
-            "Time Series Crypto (5min)",
-            {},
-        )
-
-        if not series:
-            raise ValueError(
-                "Alpha Vantage BTCUSD sans données."
+            m15, m5, m1 = (
+                fetch_coingecko_btc()
             )
 
-        rows = []
-
-        for timestamp, values in series.items():
-            rows.append(
-                {
-                    "timestamp": timestamp,
-                    "open": values.get("1. open"),
-                    "high": values.get("2. high"),
-                    "low": values.get("3. low"),
-                    "close": values.get("4. close"),
-                    "volume": values.get("5. volume"),
-                }
+            price = safe_float(
+                m1.iloc[-1]["close"]
             )
+
+            metadata = {
+                "source": "CoinGecko",
+                "price": price,
+                "m15_price": safe_float(
+                    m15.iloc[-1]["close"]
+                ),
+                "m5_price": safe_float(
+                    m5.iloc[-1]["close"]
+                ),
+                "m1_price": price,
+                "m1_volume": safe_float(
+                    m1.iloc[-1]["volume"]
+                ),
+            }
+
+            logger.info(
+                "| [COINGECKO OK] %s | "
+                "M15: %s | M5: %s | M1: %s",
+                symbol,
+                format_price(
+                    symbol,
+                    metadata["m15_price"],
+                ),
+                format_price(
+                    symbol,
+                    metadata["m5_price"],
+                ),
+                format_price(
+                    symbol,
+                    metadata["m1_price"],
+                ),
+            )
+
+            return (
+                m15,
+                m5,
+                m1,
+                metadata,
+            )
+
+        except Exception as exc:
+
+            logger.warning(
+                "[COINGECKO] %s indisponible : %s",
+                symbol,
+                exc,
+            )
+
+    # --------------------------------------------------------
+    # SOURCE 4 : ALPHA VANTAGE
+    # --------------------------------------------------------
+
+    if ALPHA_VANTAGE_API_KEY:
+
+        try:
+
+            # Alpha Vantage est utilisé ici uniquement
+            # comme secours supplémentaire.
+            result = fetch_alpha_multitimeframe(
+                symbol
+            )
+
+            logger.info(
+                "| [ALPHA OK] %s | M15: %s | "
+                "M5: %s | M1: %s",
+                symbol,
+                format_price(
+                    symbol,
+                    result[3]["m15_price"],
+                ),
+                format_price(
+                    symbol,
+                    result[3]["m5_price"],
+                ),
+                format_price(
+                    symbol,
+                    result[3]["m1_price"],
+                ),
+            )
+
+            return result
+
+        except Exception as exc:
+
+            logger.warning(
+                "[ALPHA] %s indisponible : %s",
+                symbol,
+                exc,
+            )
+
+    # --------------------------------------------------------
+    # SOURCE 5 : TWELVE DATA
+    # --------------------------------------------------------
+
+    if TWELVE_DATA_API_KEY:
+
+        try:
+
+            result = fetch_twelve_multitimeframe(
+                symbol
+            )
+
+            logger.info(
+                "| [TWELVE OK] %s | M15: %s | "
+                "M5: %s | M1: %s",
+                symbol,
+                format_price(
+                    symbol,
+                    result[3]["m15_price"],
+                ),
+                format_price(
+                    symbol,
+                    result[3]["m5_price"],
+                ),
+                format_price(
+                    symbol,
+                    result[3]["m1_price"],
+                ),
+            )
+
+            return result
+
+        except Exception as exc:
+
+            logger.warning(
+                "[TWELVE] %s indisponible : %s",
+                symbol,
+                exc,
+            )
+
+    raise RuntimeError(
+        f"Toutes les sources ont échoué pour {symbol}."
+    )
+
+
+# ============================================================
+# ALPHA VANTAGE SECOURS
+# ============================================================
+
+def fetch_alpha_series(
+    symbol: str,
+) -> pd.DataFrame:
+
+    url = (
+        "https://www.alphavantage.co/query"
+    )
+
+    if symbol == "BTCUSD":
+
+        params = {
+            "function": "CRYPTO_INTRADAY",
+            "symbol": "BTC",
+            "market": "USD",
+            "interval": "5min",
+            "outputsize": "full",
+            "apikey": ALPHA_VANTAGE_API_KEY,
+        }
+
+        series_key = (
+            "Time Series Crypto (5min)"
+        )
 
     else:
 
-        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "FX_INTRADAY",
+            "from_symbol": ASSETS[symbol][
+                "alpha_from"
+            ],
+            "to_symbol": ASSETS[symbol][
+                "alpha_to"
+            ],
+            "interval": "5min",
+            "outputsize": "full",
+            "apikey": ALPHA_VANTAGE_API_KEY,
+        }
 
-        response = session.get(
-            url,
-            params={
-                "function": "FX_INTRADAY",
-                "from_symbol": ASSETS[symbol]["alpha_from"],
-                "to_symbol": ASSETS[symbol]["alpha_to"],
-                "interval": "5min",
-                "outputsize": "full",
-                "apikey": ALPHA_VANTAGE_API_KEY,
-            },
-            timeout=15,
+        series_key = (
+            "Time Series FX (5min)"
         )
-
-        response.raise_for_status()
-
-        payload = response.json()
-
-        series = payload.get(
-            "Time Series FX (5min)",
-            {},
-        )
-
-        if not series:
-            raise ValueError(
-                "Alpha Vantage FX sans données."
-            )
-
-        rows = []
-
-        for timestamp, values in series.items():
-            rows.append(
-                {
-                    "timestamp": timestamp,
-                    "open": values.get("1. open"),
-                    "high": values.get("2. high"),
-                    "low": values.get("3. low"),
-                    "close": values.get("4. close"),
-                    "volume": np.nan,
-                }
-            )
-
-    df = pd.DataFrame(rows)
-
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        errors="coerce",
-        utc=True,
-    )
-
-    df = df.set_index("timestamp")
-
-    df = normalize_dataframe(
-        df,
-        limit=LOOKBACK_CANDLES,
-    )
-
-    if len(df) < 30:
-        raise ValueError(
-            f"Pas assez de données Alpha Vantage pour {symbol}."
-        )
-
-    latest = df.iloc[-1]
-
-    return df, {
-        "source": "Alpha Vantage",
-        "price": safe_float(latest["close"]),
-        "volume": safe_float(latest["volume"]),
-        "timestamp": str(df.index[-1]),
-    }
-
-
-# ============================================================
-# TWELVE DATA - SECOURS 4
-# ============================================================
-
-def fetch_twelve_data(
-    symbol: str,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-
-    if not TWELVE_DATA_API_KEY:
-        raise ValueError(
-            "TWELVE_DATA_API_KEY non configurée."
-        )
-
-    url = "https://api.twelvedata.com/time_series"
 
     response = session.get(
         url,
-        params={
-            "symbol": ASSETS[symbol]["twelve"],
-            "interval": "5min",
-            "outputsize": LOOKBACK_CANDLES,
-            "apikey": TWELVE_DATA_API_KEY,
-            "format": "JSON",
-        },
+        params=params,
         timeout=15,
     )
 
@@ -774,26 +1518,38 @@ def fetch_twelve_data(
 
     payload = response.json()
 
-    values = payload.get("values")
+    series = payload.get(
+        series_key,
+        {},
+    )
 
-    if not isinstance(values, list) or not values:
-        message = payload.get(
-            "message",
-            "Twelve Data sans données.",
+    if not series:
+        raise RuntimeError(
+            str(
+                payload.get(
+                    "Note",
+                    payload.get(
+                        "Information",
+                        "Alpha Vantage sans données.",
+                    ),
+                )
+            )
         )
-        raise ValueError(message)
 
     rows = []
 
-    for item in values:
+    for timestamp, values in series.items():
+
         rows.append(
             {
-                "timestamp": item.get("datetime"),
-                "open": item.get("open"),
-                "high": item.get("high"),
-                "low": item.get("low"),
-                "close": item.get("close"),
-                "volume": item.get("volume"),
+                "timestamp": timestamp,
+                "open": values.get("1. open"),
+                "high": values.get("2. high"),
+                "low": values.get("3. low"),
+                "close": values.get("4. close"),
+                "volume": values.get(
+                    "5. volume"
+                ),
             }
         )
 
@@ -805,145 +1561,226 @@ def fetch_twelve_data(
         utc=True,
     )
 
-    df = df.set_index("timestamp")
+    df = df.set_index(
+        "timestamp"
+    )
+
+    return normalize_dataframe(
+        df,
+        M5_CANDLES,
+    )
+
+
+def fetch_alpha_multitimeframe(
+    symbol: str,
+):
+
+    m5 = fetch_alpha_series(
+        symbol
+    )
+
+    m1 = m5.resample(
+        "1min"
+    ).ffill()
+
+    m15 = resample_ohlcv(
+        m5,
+        "15min",
+        M15_CANDLES,
+    )
+
+    m5 = normalize_dataframe(
+        m5,
+        M5_CANDLES,
+    )
+
+    m1 = normalize_dataframe(
+        m1,
+        M1_CANDLES,
+    )
+
+    metadata = {
+        "source": "Alpha Vantage",
+        "price": safe_float(
+            m1.iloc[-1]["close"]
+        ),
+        "m15_price": safe_float(
+            m15.iloc[-1]["close"]
+        ),
+        "m5_price": safe_float(
+            m5.iloc[-1]["close"]
+        ),
+        "m1_price": safe_float(
+            m1.iloc[-1]["close"]
+        ),
+        "m1_volume": safe_float(
+            m1.iloc[-1]["volume"]
+        ),
+    }
+
+    return (
+        m15,
+        m5,
+        m1,
+        metadata,
+    )
+
+
+# ============================================================
+# TWELVE DATA SECOURS
+# ============================================================
+
+def fetch_twelve_multitimeframe(
+    symbol: str,
+):
+
+    url = (
+        "https://api.twelvedata.com/time_series"
+    )
+
+    response = session.get(
+        url,
+        params={
+            "symbol": ASSETS[symbol]["twelve"],
+            "interval": "1min",
+            "outputsize": M1_CANDLES,
+            "apikey": TWELVE_DATA_API_KEY,
+            "format": "JSON",
+        },
+        timeout=15,
+    )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    values = payload.get(
+        "values"
+    )
+
+    if not values:
+
+        raise RuntimeError(
+            payload.get(
+                "message",
+                "Twelve Data sans données.",
+            )
+        )
+
+    rows = []
+
+    for item in values:
+
+        rows.append(
+            {
+                "timestamp": item.get(
+                    "datetime"
+                ),
+                "open": item.get(
+                    "open"
+                ),
+                "high": item.get(
+                    "high"
+                ),
+                "low": item.get(
+                    "low"
+                ),
+                "close": item.get(
+                    "close"
+                ),
+                "volume": item.get(
+                    "volume"
+                ),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        errors="coerce",
+        utc=True,
+    )
+
+    df = df.set_index(
+        "timestamp"
+    )
 
     df = normalize_dataframe(
         df,
-        limit=LOOKBACK_CANDLES,
+        M1_CANDLES,
     )
 
-    if len(df) < 30:
-        raise ValueError(
-            f"Pas assez de données Twelve Data pour {symbol}."
-        )
+    m5 = resample_ohlcv(
+        df,
+        "5min",
+        M5_CANDLES,
+    )
 
-    latest = df.iloc[-1]
+    m15 = resample_ohlcv(
+        df,
+        "15min",
+        M15_CANDLES,
+    )
 
-    return df, {
+    metadata = {
         "source": "Twelve Data",
-        "price": safe_float(latest["close"]),
-        "volume": safe_float(latest["volume"]),
-        "timestamp": str(df.index[-1]),
+        "price": safe_float(
+            df.iloc[-1]["close"]
+        ),
+        "m15_price": safe_float(
+            m15.iloc[-1]["close"]
+        ),
+        "m5_price": safe_float(
+            m5.iloc[-1]["close"]
+        ),
+        "m1_price": safe_float(
+            df.iloc[-1]["close"]
+        ),
+        "m1_volume": safe_float(
+            df.iloc[-1]["volume"]
+        ),
     }
 
-
-# ============================================================
-# DATA PROVIDER - CASCADE
-# ============================================================
-
-def get_market_data(
-    symbol: str,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-
-    providers = [
-        ("BIQUOTE", fetch_biquote_ohlc),
-        ("Yahoo", fetch_yahoo),
-    ]
-
-    if symbol == "BTCUSD":
-        providers.append(
-            ("CoinGecko", fetch_coingecko)
-        )
-
-    providers.extend(
-        [
-            ("Alpha Vantage", fetch_alpha_vantage),
-            ("Twelve Data", fetch_twelve_data),
-        ]
+    return (
+        m15,
+        m5,
+        df,
+        metadata,
     )
-
-    errors = []
-
-    for provider_name, provider in providers:
-
-        try:
-            df, metadata = provider(symbol)
-
-            if df is None or df.empty:
-                raise ValueError("Données vides.")
-
-            price = safe_float(metadata.get("price"))
-
-            if price is None:
-                raise ValueError(
-                    "Prix indisponible."
-                )
-
-            metadata["source"] = provider_name
-
-            logger.info(
-                "| [%s OK] %s | Prix: %s | Volume: %s",
-                provider_name.upper(),
-                symbol,
-                format_price(symbol, price),
-                format_volume(metadata.get("volume")),
-            )
-
-            return df, metadata
-
-        except Exception as exc:
-
-            error_text = str(exc)
-
-            errors.append(
-                f"{provider_name}: {error_text}"
-            )
-
-            logger.warning(
-                "[%s] %s indisponible pour %s : %s",
-                provider_name,
-                symbol,
-                symbol,
-                error_text,
-            )
-
-    raise RuntimeError(
-        f"Aucune source disponible pour {symbol}. "
-        + " | ".join(errors)
-    )
-
-
-# ============================================================
-# PRICE STATE
-# ============================================================
-
-def update_price_state(
-    symbol: str,
-    metadata: Dict[str, Any],
-) -> None:
-
-    with state_lock:
-
-        last_prices[symbol] = {
-            "symbol": symbol,
-            "price": metadata.get("price"),
-            "volume": metadata.get("volume"),
-            "source": metadata.get("source"),
-            "timestamp": metadata.get(
-                "timestamp",
-                utc_now().isoformat(),
-            ),
-            "updated_at": utc_now(),
-        }
 
 
 # ============================================================
 # PRICE ACTION
 # ============================================================
 
-def candle_body_ratio(row: pd.Series) -> float:
+def candle_body_ratio(
+    candle: pd.Series,
+) -> float:
 
-    high = safe_float(row["high"])
-    low = safe_float(row["low"])
-    open_price = safe_float(row["open"])
-    close = safe_float(row["close"])
+    open_price = safe_float(
+        candle["open"]
+    )
+
+    close = safe_float(
+        candle["close"]
+    )
+
+    high = safe_float(
+        candle["high"]
+    )
+
+    low = safe_float(
+        candle["low"]
+    )
 
     if None in (
-        high,
-        low,
         open_price,
         close,
+        high,
+        low,
     ):
+
         return 0.0
 
     total_range = high - low
@@ -951,470 +1788,1028 @@ def candle_body_ratio(row: pd.Series) -> float:
     if total_range <= 0:
         return 0.0
 
-    real_body = abs(close - open_price)
+    return abs(
+        close - open_price
+    ) / total_range
 
-    return real_body / total_range
 
-
-def is_bullish_engulfing(
+def bullish_engulfing(
     previous: pd.Series,
     current: pd.Series,
 ) -> bool:
 
-    prev_open = safe_float(previous["open"])
-    prev_close = safe_float(previous["close"])
+    po = safe_float(previous["open"])
+    pc = safe_float(previous["close"])
 
-    cur_open = safe_float(current["open"])
-    cur_close = safe_float(current["close"])
+    co = safe_float(current["open"])
+    cc = safe_float(current["close"])
 
     if None in (
-        prev_open,
-        prev_close,
-        cur_open,
-        cur_close,
+        po,
+        pc,
+        co,
+        cc,
     ):
+
         return False
 
-    previous_bearish = prev_close < prev_open
-    current_bullish = cur_close > cur_open
-
-    body_engulfs = (
-        cur_open <= prev_close
-        and cur_close >= prev_open
-    )
-
     return (
-        previous_bearish
-        and current_bullish
-        and body_engulfs
+        pc < po
+        and cc > co
+        and co <= pc
+        and cc >= po
     )
 
 
-def is_bearish_engulfing(
+def bearish_engulfing(
     previous: pd.Series,
     current: pd.Series,
 ) -> bool:
 
-    prev_open = safe_float(previous["open"])
-    prev_close = safe_float(previous["close"])
+    po = safe_float(previous["open"])
+    pc = safe_float(previous["close"])
 
-    cur_open = safe_float(current["open"])
-    cur_close = safe_float(current["close"])
+    co = safe_float(current["open"])
+    cc = safe_float(current["close"])
 
     if None in (
-        prev_open,
-        prev_close,
-        cur_open,
-        cur_close,
+        po,
+        pc,
+        co,
+        cc,
     ):
+
         return False
 
-    previous_bullish = prev_close > prev_open
-    current_bearish = cur_close < cur_open
-
-    body_engulfs = (
-        cur_open >= prev_close
-        and cur_close <= prev_open
+    return (
+        pc > po
+        and cc < co
+        and co >= pc
+        and cc <= po
     )
 
+
+def bullish_pin_bar(
+    candle: pd.Series,
+) -> bool:
+
+    o = safe_float(candle["open"])
+    c = safe_float(candle["close"])
+    h = safe_float(candle["high"])
+    l = safe_float(candle["low"])
+
+    if None in (
+        o,
+        c,
+        h,
+        l,
+    ):
+
+        return False
+
+    body = abs(c - o)
+    total = h - l
+
+    if total <= 0:
+        return False
+
+    lower_wick = min(o, c) - l
+    upper_wick = h - max(o, c)
+
     return (
-        previous_bullish
-        and current_bearish
-        and body_engulfs
+        c > o
+        and lower_wick >= body * 2
+        and lower_wick > upper_wick
+    )
+
+
+def bearish_pin_bar(
+    candle: pd.Series,
+) -> bool:
+
+    o = safe_float(candle["open"])
+    c = safe_float(candle["close"])
+    h = safe_float(candle["high"])
+    l = safe_float(candle["low"])
+
+    if None in (
+        o,
+        c,
+        h,
+        l,
+    ):
+
+        return False
+
+    body = abs(c - o)
+    total = h - l
+
+    if total <= 0:
+        return False
+
+    lower_wick = min(o, c) - l
+    upper_wick = h - max(o, c)
+
+    return (
+        c < o
+        and upper_wick >= body * 2
+        and upper_wick > lower_wick
+    )
+
+
+def detect_price_action(
+    df: pd.DataFrame,
+    direction: str,
+) -> Optional[str]:
+
+    if len(df) < 3:
+        return None
+
+    previous = df.iloc[-2]
+    current = df.iloc[-1]
+
+    ratio = candle_body_ratio(
+        current
+    )
+
+    # Exigence stricte du cahier des charges.
+    if ratio < 0.60:
+        return None
+
+    if direction == "BUY":
+
+        if bullish_engulfing(
+            previous,
+            current,
+        ):
+
+            return "AVALement HAUSSIER"
+
+        if bullish_pin_bar(
+            current
+        ):
+
+            return "PIN BAR HAUSSIER"
+
+    if direction == "SELL":
+
+        if bearish_engulfing(
+            previous,
+            current,
+        ):
+
+            return "AVALement BAISSIER"
+
+        if bearish_pin_bar(
+            current
+        ):
+
+            return "PIN BAR BAISSIER"
+
+    return None
+
+
+# ============================================================
+# SMC M15 : BOS + ORDER BLOCK
+# ============================================================
+
+def detect_swings(
+    df: pd.DataFrame,
+    left: int = 2,
+    right: int = 2,
+) -> Tuple[
+    List[Tuple[pd.Timestamp, float]],
+    List[Tuple[pd.Timestamp, float]],
+]:
+
+    highs = []
+    lows = []
+
+    if len(df) < left + right + 3:
+        return highs, lows
+
+    for i in range(
+        left,
+        len(df) - right,
+    ):
+
+        high = float(
+            df.iloc[i]["high"]
+        )
+
+        low = float(
+            df.iloc[i]["low"]
+        )
+
+        previous_highs = (
+            df["high"]
+            .iloc[
+                i - left:i
+            ]
+            .astype(float)
+        )
+
+        next_highs = (
+            df["high"]
+            .iloc[
+                i + 1:i + right + 1
+            ]
+            .astype(float)
+        )
+
+        previous_lows = (
+            df["low"]
+            .iloc[
+                i - left:i
+            ]
+            .astype(float)
+        )
+
+        next_lows = (
+            df["low"]
+            .iloc[
+                i + 1:i + right + 1
+            ]
+            .astype(float)
+        )
+
+        if (
+            high > previous_highs.max()
+            and high >= next_highs.max()
+        ):
+
+            highs.append(
+                (
+                    df.index[i],
+                    high,
+                )
+            )
+
+        if (
+            low < previous_lows.min()
+            and low <= next_lows.min()
+        ):
+
+            lows.append(
+                (
+                    df.index[i],
+                    low,
+                )
+            )
+
+    return highs, lows
+
+
+def find_m15_bos_and_ob(
+    df: pd.DataFrame,
+) -> Optional[Dict[str, Any]]:
+
+    if len(df) < 30:
+        return None
+
+    highs, lows = detect_swings(
+        df.tail(80)
+    )
+
+    if not highs or not lows:
+        return None
+
+    last_close = safe_float(
+        df.iloc[-1]["close"]
+    )
+
+    if last_close is None:
+        return None
+
+    latest_high_time, latest_high = highs[-1]
+    latest_low_time, latest_low = lows[-1]
+
+    previous_high = (
+        highs[-2][1]
+        if len(highs) >= 2
+        else latest_high
+    )
+
+    previous_low = (
+        lows[-2][1]
+        if len(lows) >= 2
+        else latest_low
+    )
+
+    direction = None
+    bos_level = None
+    bos_time = None
+
+    # BOS haussier confirmé par clôture.
+    if (
+        latest_high > previous_high
+        and last_close > latest_high
+    ):
+
+        direction = "BUY"
+        bos_level = latest_high
+        bos_time = latest_high_time
+
+    # BOS baissier confirmé par clôture.
+    elif (
+        latest_low < previous_low
+        and last_close < latest_low
+    ):
+
+        direction = "SELL"
+        bos_level = latest_low
+        bos_time = latest_low_time
+
+    if direction is None:
+        return None
+
+    # --------------------------------------------------------
+    # Order Block M15
+    #
+    # BUY :
+    # dernière bougie baissière avant l'impulsion BOS.
+    #
+    # SELL :
+    # dernière bougie haussière avant l'impulsion BOS.
+    # --------------------------------------------------------
+
+    bos_position = df.index.get_loc(
+        bos_time
+    )
+
+    if isinstance(
+        bos_position,
+        slice,
+    ):
+        return None
+
+    search_start = max(
+        0,
+        bos_position - 12,
+    )
+
+    candidates = df.iloc[
+        search_start:bos_position + 1
+    ]
+
+    ob = None
+
+    for i in range(
+        len(candidates) - 1,
+        -1,
+        -1,
+    ):
+
+        candle = candidates.iloc[i]
+
+        o = safe_float(
+            candle["open"]
+        )
+
+        c = safe_float(
+            candle["close"]
+        )
+
+        if o is None or c is None:
+            continue
+
+        if direction == "BUY" and c < o:
+
+            ob = {
+                "high": safe_float(
+                    candle["high"]
+                ),
+                "low": safe_float(
+                    candle["low"]
+                ),
+                "time": str(
+                    candidates.index[i]
+                ),
+            }
+
+            break
+
+        if direction == "SELL" and c > o:
+
+            ob = {
+                "high": safe_float(
+                    candle["high"]
+                ),
+                "low": safe_float(
+                    candle["low"]
+                ),
+                "time": str(
+                    candidates.index[i]
+                ),
+            }
+
+            break
+
+    if not ob:
+        return None
+
+    if (
+        ob["high"] is None
+        or ob["low"] is None
+    ):
+        return None
+
+    return {
+        "direction": direction,
+        "bos_level": bos_level,
+        "bos_time": str(bos_time),
+        "ob_high": ob["high"],
+        "ob_low": ob["low"],
+        "ob_time": ob["time"],
+    }
+
+
+def price_in_order_block(
+    price: float,
+    ob: Dict[str, Any],
+) -> bool:
+
+    low = safe_float(
+        ob.get("ob_low")
+    )
+
+    high = safe_float(
+        ob.get("ob_high")
+    )
+
+    if low is None or high is None:
+        return False
+
+    return (
+        low <= price <= high
     )
 
 
 # ============================================================
-# SMV
+# SMV M5
 # ============================================================
 
 def validate_smv(
     df: pd.DataFrame,
-) -> Tuple[bool, str]:
+) -> Tuple[
+    bool,
+    str,
+]:
 
     if len(df) < 22:
-        return False, "Pas assez de bougies."
+        return False, "Historique M5 insuffisant."
 
     volumes = pd.to_numeric(
         df["volume"],
         errors="coerce",
     )
 
-    current_volume = safe_float(volumes.iloc[-1])
+    current_volume = safe_float(
+        volumes.iloc[-1]
+    )
 
-    previous_20 = volumes.iloc[-21:-1]
-
-    previous_3 = volumes.iloc[-4:-1]
+    previous_20 = volumes.iloc[
+        -21:-1
+    ]
 
     if current_volume is None:
-        return False, "Volume actuel indisponible."
+        return False, "Volume M5 indisponible."
 
     if previous_20.isna().any():
-        return False, "Historique volume incomplet."
-
-    if previous_3.isna().any():
-        return False, "Historique volume récent incomplet."
+        return False, "Volumes M5 incomplets."
 
     average_20 = safe_float(
         previous_20.mean()
     )
 
-    if average_20 is None or average_20 <= 0:
+    if (
+        average_20 is None
+        or average_20 <= 0
+    ):
+
         return False, "Moyenne volume invalide."
 
-    condition_multiplier = (
-        current_volume > 2.0 * average_20
-    )
+    if current_volume <= (
+        2.0 * average_20
+    ):
 
-    condition_isolated_spike = (
-        current_volume > previous_3.max()
-    )
-
-    if not condition_multiplier:
         return (
             False,
-            "Volume inférieur ou égal à 2x moyenne 20."
+            (
+                f"Volume {current_volume:.2f} "
+                f"<= 2x moyenne "
+                f"{average_20:.2f}"
+            ),
         )
 
-    if not condition_isolated_spike:
+    # Spike isolé : le volume actuel doit également
+    # être supérieur aux 3 bougies précédentes.
+    previous_3 = volumes.iloc[
+        -4:-1
+    ]
+
+    if previous_3.isna().any():
+        return False, "Volumes récents incomplets."
+
+    if current_volume <= previous_3.max():
+
         return (
             False,
-            "Volume non supérieur aux 3 bougies précédentes."
+            "Spike M5 non isolé.",
         )
 
-    return True, (
-        f"Volume {current_volume:.2f} > "
-        f"2x moyenne20 {average_20:.2f} "
-        f"et supérieur aux 3 précédents."
+    return (
+        True,
+        (
+            f"Volume {current_volume:.2f} > "
+            f"2x moyenne20 {average_20:.2f}."
+        ),
     )
 
 
 # ============================================================
-# STRUCTURE / CHoCH
+# CHoCH M5
 # ============================================================
 
-def find_recent_structure(
+def detect_m5_choch(
     df: pd.DataFrame,
-    lookback: int = 15,
-) -> Dict[str, float]:
+    expected_direction: str,
+) -> Optional[Dict[str, Any]]:
 
-    window = df.tail(lookback).copy()
+    if len(df) < CHOC_LOOKBACK:
+        return None
 
-    if len(window) < 7:
-        return {}
+    window = df.tail(
+        CHOC_LOOKBACK
+    ).copy()
 
-    highs = window["high"].astype(float)
-    lows = window["low"].astype(float)
-
-    pivot_highs = []
-    pivot_lows = []
-
-    for i in range(2, len(window) - 2):
-
-        high = highs.iloc[i]
-        low = lows.iloc[i]
-
-        previous_highs = highs.iloc[i - 2:i]
-        next_highs = highs.iloc[i + 1:i + 3]
-
-        previous_lows = lows.iloc[i - 2:i]
-        next_lows = lows.iloc[i + 1:i + 3]
-
-        if high > previous_highs.max() and high >= next_highs.max():
-            pivot_highs.append(high)
-
-        if low < previous_lows.min() and low <= next_lows.min():
-            pivot_lows.append(low)
-
-    latest_pivot_high = (
-        pivot_highs[-1]
-        if pivot_highs
-        else float(highs.iloc[:-1].max())
-    )
-
-    latest_pivot_low = (
-        pivot_lows[-1]
-        if pivot_lows
-        else float(lows.iloc[:-1].min())
-    )
-
-    previous_pivot_high = (
-        pivot_highs[-2]
-        if len(pivot_highs) >= 2
-        else latest_pivot_high
-    )
-
-    previous_pivot_low = (
-        pivot_lows[-2]
-        if len(pivot_lows) >= 2
-        else latest_pivot_low
-    )
-
-    return {
-        "latest_high": float(latest_pivot_high),
-        "latest_low": float(latest_pivot_low),
-        "previous_high": float(previous_pivot_high),
-        "previous_low": float(previous_pivot_low),
-    }
-
-
-def detect_choch(
-    df: pd.DataFrame,
-) -> Tuple[Optional[str], str, Dict[str, float]]:
-
-    if len(df) < 15:
-        return None, "Pas assez de bougies pour CHoCH.", {}
-
-    window = df.tail(15).copy()
-
-    structure = find_recent_structure(
+    highs, lows = detect_swings(
         window,
-        lookback=15,
+        left=2,
+        right=2,
     )
 
-    if not structure:
-        return None, "Structure indisponible.", {}
+    if not highs or not lows:
+        return None
 
     latest_close = safe_float(
         window.iloc[-1]["close"]
     )
 
     if latest_close is None:
-        return None, "Clôture indisponible.", structure
+        return None
 
-    latest_high = structure["latest_high"]
-    latest_low = structure["latest_low"]
+    if expected_direction == "BUY":
 
-    previous_high = structure["previous_high"]
-    previous_low = structure["previous_low"]
+        if not highs:
+            return None
 
-    bullish_structure = (
-        latest_high > previous_high
-        or latest_low > previous_low
-    )
+        resistance = highs[-1][1]
 
-    bearish_structure = (
-        latest_high < previous_high
-        or latest_low < previous_low
-    )
+        # Clôture au-dessus de la structure.
+        if latest_close <= resistance:
+            return None
 
-    # CHoCH haussier :
-    # le corps clôture au-dessus de la dernière résistance.
-    bullish_break = (
-        latest_close > latest_high
-    )
-
-    # CHoCH baissier :
-    # le corps clôture sous le dernier support.
-    bearish_break = (
-        latest_close < latest_low
-    )
-
-    if bearish_structure and bullish_break:
-        return (
-            "BUY",
-            (
-                "CHoCH haussier confirmé par clôture "
-                "du corps au-dessus de la structure."
+        return {
+            "direction": "BUY",
+            "level": resistance,
+            "candle_time": str(
+                window.index[-1]
             ),
-            structure,
-        )
+        }
 
-    if bullish_structure and bearish_break:
-        return (
-            "SELL",
-            (
-                "CHoCH baissier confirmé par clôture "
-                "du corps sous la structure."
+    if expected_direction == "SELL":
+
+        support = lows[-1][1]
+
+        # Clôture sous la structure.
+        if latest_close >= support:
+            return None
+
+        return {
+            "direction": "SELL",
+            "level": support,
+            "candle_time": str(
+                window.index[-1]
             ),
-            structure,
-        )
+        }
 
-    return (
-        None,
-        "Aucun CHoCH confirmé par clôture.",
-        structure,
-    )
+    return None
 
 
 # ============================================================
-# STRATÉGIE SMC + PA + SMV
+# MICRO ORDER BLOCK M1
 # ============================================================
 
-def analyze_smc_pa_smv(
+def find_micro_order_block(
     df: pd.DataFrame,
+    direction: str,
 ) -> Optional[Dict[str, Any]]:
 
-    if df is None or len(df) < 30:
+    if len(df) < 8:
         return None
 
-    df = df.copy()
+    # On recherche l'impulsion récente.
+    for i in range(
+        len(df) - 2,
+        max(
+            1,
+            len(df) - 10,
+        ),
+        -1,
+    ):
 
-    # Retirer la bougie en formation si elle existe.
-    if "isOpen" in df.columns:
-        closed_df = df[
-            ~df["isOpen"].fillna(False).astype(bool)
-        ].copy()
+        candle = df.iloc[i]
+        next_candle = df.iloc[i + 1]
 
-        if len(closed_df) >= 30:
-            df = closed_df
+        o = safe_float(
+            candle["open"]
+        )
 
-    if len(df) < 30:
-        return None
+        c = safe_float(
+            candle["close"]
+        )
 
-    # --------------------------------------------------------
-    # 1. SMV
-    # --------------------------------------------------------
+        h = safe_float(
+            candle["high"]
+        )
 
-    smv_ok, smv_reason = validate_smv(df)
+        l = safe_float(
+            candle["low"]
+        )
 
-    if not smv_ok:
-        return None
+        next_o = safe_float(
+            next_candle["open"]
+        )
 
-    # --------------------------------------------------------
-    # 2. CHoCH SMC
-    # --------------------------------------------------------
+        next_c = safe_float(
+            next_candle["close"]
+        )
 
-    direction, choch_reason, structure = detect_choch(df)
+        if None in (
+            o,
+            c,
+            h,
+            l,
+            next_o,
+            next_c,
+        ):
+            continue
 
-    if direction not in ("BUY", "SELL"):
-        return None
+        # BUY :
+        # dernière bougie baissière suivie d'une
+        # impulsion haussière.
+        if direction == "BUY":
 
-    # --------------------------------------------------------
-    # 3. PRICE ACTION
-    # --------------------------------------------------------
+            if (
+                c < o
+                and next_c > next_o
+                and next_c > h
+            ):
 
-    previous = df.iloc[-2]
-    current = df.iloc[-1]
+                return {
+                    "direction": "BUY",
+                    "high": h,
+                    "low": l,
+                    "time": str(
+                        df.index[i]
+                    ),
+                    "impulse_time": str(
+                        df.index[i + 1]
+                    ),
+                }
 
-    body_ratio = candle_body_ratio(current)
+        # SELL :
+        # dernière bougie haussière suivie d'une
+        # impulsion baissière.
+        if direction == "SELL":
 
-    if body_ratio < 0.60:
-        return None
+            if (
+                c > o
+                and next_c < next_o
+                and next_c < l
+            ):
 
-    bullish_engulfing = is_bullish_engulfing(
-        previous,
-        current,
+                return {
+                    "direction": "SELL",
+                    "high": h,
+                    "low": l,
+                    "time": str(
+                        df.index[i]
+                    ),
+                    "impulse_time": str(
+                        df.index[i + 1]
+                    ),
+                }
+
+    return None
+
+
+def micro_ob_entry(
+    ob: Dict[str, Any],
+) -> Optional[float]:
+
+    high = safe_float(
+        ob.get("high")
     )
 
-    bearish_engulfing = is_bearish_engulfing(
-        previous,
-        current,
+    low = safe_float(
+        ob.get("low")
     )
 
-    if direction == "BUY" and not bullish_engulfing:
+    if high is None or low is None:
         return None
 
-    if direction == "SELL" and not bearish_engulfing:
+    if high <= low:
         return None
 
-    # --------------------------------------------------------
-    # 4. ENTRY
-    # --------------------------------------------------------
+    # Prix central du micro-OB.
+    return (
+        high + low
+    ) / 2.0
 
-    entry = safe_float(current["close"])
 
-    if entry is None:
+# ============================================================
+# SL / TP
+# ============================================================
+
+def calculate_trade_levels(
+    symbol: str,
+    direction: str,
+    entry: float,
+    m1_df: pd.DataFrame,
+) -> Optional[Dict[str, float]]:
+
+    if len(m1_df) < 6:
         return None
 
-    # --------------------------------------------------------
-    # 5. SL SERRÉ SUR STRUCTURE RÉCENTE
-    # --------------------------------------------------------
+    recent = m1_df.tail(
+        6
+    ).copy()
 
-    recent_structure = df.iloc[-6:-1]
-
-    if recent_structure.empty:
-        return None
+    buffer = ASSETS[symbol][
+        "buffer"
+    ]
 
     if direction == "BUY":
 
-        structure_low = safe_float(
-            recent_structure["low"].min()
+        structure = safe_float(
+            recent["low"].min()
         )
 
-        if structure_low is None:
+        if structure is None:
             return None
 
-        sl = structure_low
+        sl = structure - buffer
 
-        # SL doit réellement être sous l'entrée.
         if sl >= entry:
             return None
 
-    else:
+        risk = entry - sl
 
-        structure_high = safe_float(
-            recent_structure["high"].max()
+        tp1 = (
+            entry
+            + risk * TP1_RR
         )
 
-        if structure_high is None:
+        tp2 = (
+            entry
+            + risk * TP2_RR
+        )
+
+    else:
+
+        structure = safe_float(
+            recent["high"].max()
+        )
+
+        if structure is None:
             return None
 
-        sl = structure_high
+        sl = structure + buffer
 
-        # SL doit réellement être au-dessus de l'entrée.
         if sl <= entry:
             return None
 
-    risk = abs(entry - sl)
+        risk = sl - entry
+
+        tp1 = (
+            entry
+            - risk * TP1_RR
+        )
+
+        tp2 = (
+            entry
+            - risk * TP2_RR
+        )
 
     if risk <= 0:
         return None
 
-    # --------------------------------------------------------
-    # 6. TP
-    # --------------------------------------------------------
-
-    if direction == "BUY":
-
-        tp1 = entry + (risk * 2.5)
-        tp2 = entry + (risk * 5.0)
-
-    else:
-
-        tp1 = entry - (risk * 2.5)
-        tp2 = entry - (risk * 5.0)
-
     return {
-        "direction": direction,
         "entry": entry,
         "sl": sl,
+        "risk": risk,
         "tp1": tp1,
         "tp2": tp2,
-        "risk": risk,
-        "rr_tp1": 2.5,
-        "rr_tp2": 5.0,
-        "smv": smv_reason,
-        "smc": choch_reason,
-        "pa": (
-            f"Englobante {'haussière' if direction == 'BUY' else 'baissière'} "
-            f"avec corps réel {body_ratio * 100:.1f}% de la range."
-        ),
-        "candle_time": str(df.index[-1]),
+        "structure": structure,
     }
 
 
 # ============================================================
-# TELEGRAM
+# ENTONNOIR COMPLET SMC + PA + SMV
 # ============================================================
 
-TELEGRAM_API_URL = (
-    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-)
+def analyze_market(
+    symbol: str,
+    m15: pd.DataFrame,
+    m5: pd.DataFrame,
+    m1: pd.DataFrame,
+    current_price: float,
+) -> Optional[Dict[str, Any]]:
 
+    # --------------------------------------------------------
+    # ÉTAPE 1 : M15
+    # BOS + OB
+    # --------------------------------------------------------
+
+    m15_setup = find_m15_bos_and_ob(
+        m15
+    )
+
+    if not m15_setup:
+        return None
+
+    direction = m15_setup[
+        "direction"
+    ]
+
+    # Le prix actuel doit être dans l'OB M15.
+    if not price_in_order_block(
+        current_price,
+        m15_setup,
+    ):
+
+        return None
+
+    # --------------------------------------------------------
+    # ÉTAPE 2 : M5
+    # CHoCH + SMV
+    # --------------------------------------------------------
+
+    smv_ok, smv_reason = (
+        validate_smv(m5)
+    )
+
+    if not smv_ok:
+        return None
+
+    m5_choch = detect_m5_choch(
+        m5,
+        direction,
+    )
+
+    if not m5_choch:
+        return None
+
+    # --------------------------------------------------------
+    # ÉTAPE 3 : M1
+    # Micro OB + PA
+    # --------------------------------------------------------
+
+    micro_ob = find_micro_order_block(
+        m1,
+        direction,
+    )
+
+    if not micro_ob:
+        return None
+
+    pa = detect_price_action(
+        m1,
+        direction,
+    )
+
+    if not pa:
+        return None
+
+    entry = micro_ob_entry(
+        micro_ob
+    )
+
+    if entry is None:
+        return None
+
+    levels = calculate_trade_levels(
+        symbol,
+        direction,
+        entry,
+        m1,
+    )
+
+    if not levels:
+        return None
+
+    # --------------------------------------------------------
+    # VALIDATION LIMIT
+    # --------------------------------------------------------
+
+    # BUY LIMIT doit être sous le prix actuel.
+    if direction == "BUY":
+
+        if entry >= current_price:
+            return None
+
+    # SELL LIMIT doit être au-dessus du prix actuel.
+    if direction == "SELL":
+
+        if entry <= current_price:
+            return None
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "order_type": (
+            "BUY LIMIT"
+            if direction == "BUY"
+            else "SELL LIMIT"
+        ),
+        "entry": entry,
+        "sl": levels["sl"],
+        "risk": levels["risk"],
+        "tp1": levels["tp1"],
+        "tp2": levels["tp2"],
+        "m15_bos": m15_setup,
+        "m5_choch": m5_choch,
+        "micro_ob": micro_ob,
+        "price_action": pa,
+        "smv_reason": smv_reason,
+        "created_at": utc_now(),
+    }
+
+
+# ============================================================
+# COOLDOWN
+# ============================================================
+
+def is_on_cooldown(
+    symbol: str,
+) -> bool:
+
+    with state_lock:
+
+        last_signal = cooldown_tracker.get(
+            symbol
+        )
+
+    if not last_signal:
+        return False
+
+    elapsed = (
+        utc_now()
+        - last_signal
+    )
+
+    return (
+        elapsed.total_seconds()
+        < SIGNAL_COOLDOWN_MINUTES * 60
+    )
+
+
+def set_cooldown(
+    symbol: str,
+) -> None:
+
+    with state_lock:
+
+        cooldown_tracker[
+            symbol
+        ] = utc_now()
+
+    save_state()
+
+
+# ============================================================
+# TELEGRAM REQUESTS
+# ============================================================
 
 def telegram_request(
     method: str,
-    payload: Optional[Dict[str, Any]] = None,
+    payload: Optional[
+        Dict[str, Any]
+    ] = None,
     timeout: int = 30,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[
+    Dict[str, Any]
+]:
 
-    url = f"{TELEGRAM_API_URL}/{method}"
+    if not TELEGRAM_BOT_TOKEN:
+        return None
 
     try:
 
         response = session.post(
-            url,
+            f"{TELEGRAM_API_URL}/{method}",
             json=payload or {},
             timeout=timeout,
         )
@@ -1447,7 +2842,7 @@ def telegram_request(
     except requests.RequestException as exc:
 
         logger.warning(
-            "Telegram %s connexion impossible : %s",
+            "Telegram %s connexion : %s",
             method,
             exc,
         )
@@ -1458,7 +2853,9 @@ def telegram_request(
 def telegram_send_message(
     chat_id: str,
     text: str,
-    reply_markup: Optional[Dict[str, Any]] = None,
+    reply_markup: Optional[
+        Dict[str, Any]
+    ] = None,
 ) -> bool:
 
     payload = {
@@ -1469,7 +2866,10 @@ def telegram_send_message(
     }
 
     if reply_markup:
-        payload["reply_markup"] = reply_markup
+
+        payload[
+            "reply_markup"
+        ] = reply_markup
 
     result = telegram_request(
         "sendMessage",
@@ -1481,14 +2881,14 @@ def telegram_send_message(
 
 
 def telegram_answer_callback(
-    callback_query_id: str,
+    callback_id: str,
     text: str,
 ) -> None:
 
     telegram_request(
         "answerCallbackQuery",
         {
-            "callback_query_id": callback_query_id,
+            "callback_query_id": callback_id,
             "text": text,
             "show_alert": False,
         },
@@ -1498,7 +2898,7 @@ def telegram_answer_callback(
 
 def telegram_delete_webhook() -> None:
 
-    result = telegram_request(
+    telegram_request(
         "deleteWebhook",
         {
             "drop_pending_updates": False,
@@ -1506,22 +2906,479 @@ def telegram_delete_webhook() -> None:
         timeout=20,
     )
 
-    if result:
-        logger.info(
-            "Webhook Telegram supprimé : polling prêt."
+
+# ============================================================
+# MESSAGE SIGNAL
+# ============================================================
+
+def build_signal_message(
+    signal: Dict[str, Any],
+) -> str:
+
+    symbol = signal["symbol"]
+
+    direction = signal[
+        "direction"
+    ]
+
+    emoji = (
+        "🟢"
+        if direction == "BUY"
+        else "🔴"
+    )
+
+    return (
+        "🚨 *SIGNAL LIMIT*\n\n"
+        f"{emoji} *{signal['order_type']} {symbol}*\n\n"
+        f"📍 Entrée : `{format_price(symbol, signal['entry'])}`\n"
+        f"🛑 SL : `{format_price(symbol, signal['sl'])}`\n"
+        f"🎯 TP1 : `{format_price(symbol, signal['tp1'])}` — RR `1:3`\n"
+        f"🎯 TP2 : `{format_price(symbol, signal['tp2'])}` — RR `1:6`\n\n"
+        "*Validation :*\n"
+        f"• M15 : BOS + OB\n"
+        f"• M5 : CHoCH + SMV > 2x moyenne20\n"
+        f"• M1 : {signal['price_action']}\n"
+        f"• Micro-OB M1 : `{format_price(symbol, signal['micro_ob']['low'])}` → "
+        f"`{format_price(symbol, signal['micro_ob']['high'])}`\n\n"
+        "⏳ Ordre valable maximum : `15 minutes`\n"
+        "🛡️ Sécurisation BE : `RR 1:1.5`\n\n"
+        "⚠️ Aucun ordre n'est exécuté automatiquement."
+    )
+
+
+# ============================================================
+# ENREGISTREMENT ORDRE LIMIT
+# ============================================================
+
+def register_pending_order(
+    signal: Dict[str, Any],
+) -> bool:
+
+    symbol = signal[
+        "symbol"
+    ]
+
+    with state_lock:
+
+        if symbol in pending_orders:
+            return False
+
+        now = utc_now()
+
+        expires_at = (
+            now
+            + timedelta(
+                minutes=PENDING_ORDER_TIMEOUT_MINUTES
+            )
         )
 
+        pending_orders[
+            symbol
+        ] = {
+            **signal,
+            "created_at": now,
+            "last_update": now,
+            "expires_at": expires_at,
+            "triggered": False,
+            "breakeven_sent": False,
+            "cancelled": False,
+        }
 
-# ============================================================
-# ADMIN SECURITY
-# ============================================================
+    save_state()
 
-def is_admin(user_id: Any) -> bool:
+    return True
 
-    if not TELEGRAM_ADMIN_ID:
+
+def send_new_signal(
+    signal: Dict[str, Any],
+) -> bool:
+
+    global total_signals
+
+    symbol = signal[
+        "symbol"
+    ]
+
+    if is_on_cooldown(
+        symbol
+    ):
+
+        logger.info(
+            "%s ignoré : cooldown actif.",
+            symbol,
+        )
+
         return False
 
-    return str(user_id).strip() == TELEGRAM_ADMIN_ID
+    if not register_pending_order(
+        signal
+    ):
+
+        logger.info(
+            "%s ignoré : ordre LIMIT déjà actif.",
+            symbol,
+        )
+
+        return False
+
+    message = build_signal_message(
+        signal
+    )
+
+    sent = telegram_send_message(
+        TELEGRAM_CHAT_ID,
+        message,
+    )
+
+    if not sent:
+
+        with state_lock:
+            pending_orders.pop(
+                symbol,
+                None,
+            )
+
+        save_state()
+
+        return False
+
+    set_cooldown(
+        symbol
+    )
+
+    with state_lock:
+        total_signals += 1
+
+    logger.info(
+        "SIGNAL LIMIT envoyé : %s %s",
+        symbol,
+        signal["order_type"],
+    )
+
+    return True
+
+
+# ============================================================
+# SUIVI DES ORDRES LIMIT
+# ============================================================
+
+def check_pending_orders() -> None:
+
+    now = utc_now()
+
+    with state_lock:
+
+        orders = {
+            symbol: dict(order)
+            for symbol, order
+            in pending_orders.items()
+        }
+
+    for symbol, order in orders.items():
+
+        try:
+
+            if order.get(
+                "triggered"
+            ):
+
+                continue
+
+            expires_at = order.get(
+                "expires_at"
+            )
+
+            if isinstance(
+                expires_at,
+                str,
+            ):
+
+                expires_at = datetime.fromisoformat(
+                    expires_at
+                )
+
+            if (
+                expires_at
+                and now >= expires_at
+            ):
+
+                cancel_pending_order(
+                    symbol
+                )
+
+                continue
+
+            current = last_prices.get(
+                symbol,
+                {}
+            )
+
+            current_price = safe_float(
+                current.get(
+                    "price"
+                )
+            )
+
+            if current_price is None:
+                continue
+
+            entry = safe_float(
+                order.get(
+                    "entry"
+                )
+            )
+
+            sl = safe_float(
+                order.get(
+                    "sl"
+                )
+            )
+
+            if (
+                entry is None
+                or sl is None
+            ):
+                continue
+
+            # BUY LIMIT :
+            # l'ordre est considéré déclenché lorsque
+            # le prix atteint ou traverse l'entrée.
+            if (
+                order["direction"]
+                == "BUY"
+                and current_price <= entry
+            ):
+
+                mark_order_triggered(
+                    symbol,
+                    current_price,
+                )
+
+                continue
+
+            # SELL LIMIT :
+            if (
+                order["direction"]
+                == "SELL"
+                and current_price >= entry
+            ):
+
+                mark_order_triggered(
+                    symbol,
+                    current_price,
+                )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur suivi ordre %s : %s",
+                symbol,
+                exc,
+            )
+
+
+def mark_order_triggered(
+    symbol: str,
+    current_price: float,
+) -> None:
+
+    with state_lock:
+
+        order = pending_orders.get(
+            symbol
+        )
+
+        if not order:
+            return
+
+        order["triggered"] = True
+        order["triggered_at"] = utc_now()
+        order["last_update"] = utc_now()
+
+    save_state()
+
+    logger.info(
+        "%s : ordre LIMIT considéré déclenché à %s.",
+        symbol,
+        current_price,
+    )
+
+
+def cancel_pending_order(
+    symbol: str,
+) -> None:
+
+    with state_lock:
+
+        order = pending_orders.pop(
+            symbol,
+            None,
+        )
+
+    if not order:
+        return
+
+    message = (
+        f"❌ *ANNULATION :* L'ordre LIMIT sur "
+        f"*{symbol}* n'a pas été déclenché à temps.\n\n"
+        "Annulez l'ordre."
+    )
+
+    telegram_send_message(
+        TELEGRAM_CHAT_ID,
+        message,
+    )
+
+    logger.info(
+        "%s : ordre LIMIT annulé après 15 minutes.",
+        symbol,
+    )
+
+    save_state()
+
+
+# ============================================================
+# BREAKEVEN
+# ============================================================
+
+def check_breakeven() -> None:
+
+    with state_lock:
+
+        orders = {
+            symbol: dict(order)
+            for symbol, order
+            in pending_orders.items()
+        }
+
+    for symbol, order in orders.items():
+
+        if not order.get(
+            "triggered"
+        ):
+
+            continue
+
+        if order.get(
+            "breakeven_sent"
+        ):
+
+            continue
+
+        current_price = safe_float(
+            last_prices.get(
+                symbol,
+                {},
+            ).get(
+                "price"
+            )
+        )
+
+        entry = safe_float(
+            order.get(
+                "entry"
+            )
+        )
+
+        sl = safe_float(
+            order.get(
+                "sl"
+            )
+        )
+
+        if None in (
+            current_price,
+            entry,
+            sl,
+        ):
+
+            continue
+
+        risk = abs(
+            entry - sl
+        )
+
+        if risk <= 0:
+            continue
+
+        if order[
+            "direction"
+        ] == "BUY":
+
+            trigger_price = (
+                entry
+                + risk * BE_TRIGGER_RR
+            )
+
+            reached = (
+                current_price
+                >= trigger_price
+            )
+
+        else:
+
+            trigger_price = (
+                entry
+                - risk * BE_TRIGGER_RR
+            )
+
+            reached = (
+                current_price
+                <= trigger_price
+            )
+
+        if not reached:
+            continue
+
+        message = (
+            f"🛡️ *SÉCURISATION :* Déplacez votre "
+            f"Stop Loss au prix d'entrée "
+            f"(Breakeven) sur *#{symbol}*"
+        )
+
+        sent = telegram_send_message(
+            TELEGRAM_CHAT_ID,
+            message,
+        )
+
+        if sent:
+
+            with state_lock:
+
+                if symbol in pending_orders:
+
+                    pending_orders[
+                        symbol
+                    ][
+                        "breakeven_sent"
+                    ] = True
+
+                    pending_orders[
+                        symbol
+                    ][
+                        "last_update"
+                    ] = utc_now()
+
+            save_state()
+
+            logger.info(
+                "%s : alerte Breakeven envoyée.",
+                symbol,
+            )
+
+
+# ============================================================
+# TELEGRAM ADMIN
+# ============================================================
+
+def is_admin(
+    user_id: Any,
+) -> bool:
+
+    return (
+        str(user_id).strip()
+        == TELEGRAM_ADMIN_ID
+    )
 
 
 def admin_keyboard() -> Dict[str, Any]:
@@ -1530,7 +3387,7 @@ def admin_keyboard() -> Dict[str, Any]:
         "inline_keyboard": [
             [
                 {
-                    "text": "📊 Statut Global du Bot",
+                    "text": "📊 Statut Global",
                     "callback_data": "admin_status",
                 }
             ],
@@ -1542,7 +3399,7 @@ def admin_keyboard() -> Dict[str, Any]:
             ],
             [
                 {
-                    "text": "🔄 Forcer un Scan Immédiat",
+                    "text": "🔄 Forcer un Scan",
                     "callback_data": "admin_scan",
                 }
             ],
@@ -1550,45 +3407,50 @@ def admin_keyboard() -> Dict[str, Any]:
     }
 
 
-# ============================================================
-# ADMIN STATUS
-# ============================================================
-
-def build_admin_status() -> str:
+def admin_status_text() -> str:
 
     with state_lock:
-        scan_count = total_scans
-        signal_count = total_signals
-        scan_time = last_scan_at
+
+        scans = total_scans
+        signals = total_signals
+        active_orders = len(
+            pending_orders
+        )
+
+        last_scan = last_scan_at
         duration = last_scan_duration
 
-    uptime = utc_now() - bot_started_at
+    uptime = (
+        utc_now()
+        - bot_started_at
+    )
 
-    status = (
-        "🟢 *STATUT GLOBAL DU BOT*\n\n"
-        f"État : `OPÉRATIONNEL`\n"
+    return (
+        "🟢 *STATUT GLOBAL*\n\n"
+        "État : `OPÉRATIONNEL`\n"
         f"Uptime : `{str(uptime).split('.')[0]}`\n"
-        f"Scans effectués : `{scan_count}`\n"
-        f"Signaux générés : `{signal_count}`\n"
-        f"Dernier scan : "
-        f"`{scan_time.isoformat() if scan_time else 'Aucun'}`\n"
+        f"Scans : `{scans}`\n"
+        f"Signaux : `{signals}`\n"
+        f"Ordres LIMIT actifs : `{active_orders}`\n"
+        f"Dernier scan : `{iso_datetime(last_scan)}`\n"
         f"Durée dernier scan : `{duration:.2f}s`\n\n"
-        "*Marchés surveillés :*\n"
-        "• XAUUSD\n"
-        "• BTCUSD\n"
-        "• GBPUSD\n"
-        "• EURUSD\n\n"
-        "Unité : `5 minutes`\n"
+        "Timeframes : `M15 / M5 / M1`\n"
+        "Cycle : `60 secondes`\n"
         "Source prioritaire : `BIQUOTE`"
     )
 
-    return status
 
-
-def build_admin_prices() -> str:
+def admin_prices_text() -> str:
 
     with state_lock:
-        snapshot = dict(last_prices)
+
+        snapshot = {
+            symbol: dict(
+                data
+            )
+            for symbol, data
+            in last_prices.items()
+        }
 
     lines = [
         "📊 *PRIX EN DIRECT*",
@@ -1597,319 +3459,108 @@ def build_admin_prices() -> str:
 
     for symbol in SYMBOLS:
 
-        item = snapshot.get(symbol)
+        item = snapshot.get(
+            symbol
+        )
 
         if not item:
 
             lines.append(
-                f"*{symbol}* : `Aucune donnée`"
+                f"*{symbol}* : `N/A`"
             )
 
             continue
 
-        price = format_price(
-            symbol,
-            item.get("price"),
+        lines.extend(
+            [
+                f"*{symbol}*",
+                f"M15 : `{format_price(symbol, item.get('m15_price'))}`",
+                f"M5 : `{format_price(symbol, item.get('m5_price'))}`",
+                f"M1 : `{format_price(symbol, item.get('m1_price'))}`",
+                f"Prix : `{format_price(symbol, item.get('price'))}`",
+                f"Source : `{item.get('source', 'N/A')}`",
+                "",
+            ]
         )
 
-        volume = format_volume(
-            item.get("volume")
+    return "\n".join(lines)
+
+
+def handle_admin_command(
+    message: Dict[str, Any],
+) -> None:
+
+    user_id = (
+        message.get(
+            "from",
+            {},
+        ).get(
+            "id"
         )
-
-        source = item.get(
-            "source",
-            "N/A",
-        )
-
-        lines.append(
-            f"*{symbol}*\n"
-            f"Prix : `{price}`\n"
-            f"Volume : `{volume}`\n"
-            f"Source : `{source}`"
-        )
-
-    return "\n\n".join(lines)
-
-
-# ============================================================
-# TELEGRAM SIGNAL
-# ============================================================
-
-def build_signal_message(
-    symbol: str,
-    signal: Dict[str, Any],
-    source: str,
-) -> str:
-
-    direction = signal["direction"]
-
-    if direction == "BUY":
-        direction_text = "🟢 ACHAT"
-    else:
-        direction_text = "🔴 VENTE"
-
-    decimals = ASSETS[symbol]["decimals"]
-
-    entry = f"{signal['entry']:.{decimals}f}"
-    sl = f"{signal['sl']:.{decimals}f}"
-    tp1 = f"{signal['tp1']:.{decimals}f}"
-    tp2 = f"{signal['tp2']:.{decimals}f}"
-
-    message = (
-        "🚨 *SIGNAL TRADING*\n\n"
-        f"*{symbol}* — {direction_text}\n"
-        f"⏱️ Unité : `5m`\n\n"
-        f"*Entrée :* `{entry}`\n"
-        f"*SL :* `{sl}`\n"
-        f"*TP1 :* `{tp1}` — RR `1:2.5`\n"
-        f"*TP2 :* `{tp2}` — RR `1:5.0`\n\n"
-        "*Confirmation SMC + PA + SMV :*\n"
-        f"• SMV : {signal['smv']}\n"
-        f"• SMC : {signal['smc']}\n"
-        f"• PA : {signal['pa']}\n\n"
-        f"📡 Source : `{source}`\n"
-        f"🕐 Bougie : `{signal['candle_time']}`"
     )
 
-    return message
-
-
-def signal_identifier(
-    symbol: str,
-    signal: Dict[str, Any],
-) -> str:
-
-    return (
-        f"{symbol}|"
-        f"{signal['direction']}|"
-        f"{signal['candle_time']}"
+    chat_id = (
+        message.get(
+            "chat",
+            {},
+        ).get(
+            "id"
+        )
     )
 
+    if not is_admin(
+        user_id
+    ):
 
-def send_signal(
-    symbol: str,
-    signal: Dict[str, Any],
-    source: str,
-) -> bool:
+        if chat_id:
 
-    global total_signals
-
-    identifier = signal_identifier(
-        symbol,
-        signal,
-    )
-
-    with state_lock:
-
-        if identifier in last_signals:
-            logger.info(
-                "Signal déjà envoyé : %s",
-                identifier,
+            telegram_send_message(
+                str(chat_id),
+                "⛔ *Accès refusé.*",
             )
-            return False
-
-    message = build_signal_message(
-        symbol,
-        signal,
-        source,
-    )
-
-    sent = telegram_send_message(
-        TELEGRAM_CHAT_ID,
-        message,
-    )
-
-    if sent:
-
-        with state_lock:
-
-            last_signals[identifier] = {
-                "symbol": symbol,
-                "direction": signal["direction"],
-                "entry": signal["entry"],
-                "sent_at": utc_now(),
-            }
-
-            total_signals += 1
-
-        logger.info(
-            "Signal Telegram envoyé : %s %s",
-            symbol,
-            signal["direction"],
-        )
-
-        return True
-
-    logger.error(
-        "Échec envoi signal Telegram : %s",
-        symbol,
-    )
-
-    return False
-
-
-# ============================================================
-# SCAN
-# ============================================================
-
-def scan_markets() -> None:
-
-    global last_scan_at
-    global last_scan_duration
-    global total_scans
-    global scan_in_progress
-
-    if not scan_lock.acquire(blocking=False):
 
         logger.warning(
-            "Scan déjà en cours. Nouveau scan ignoré."
+            "Commande /admin refusée : %s",
+            user_id,
         )
 
         return
 
-    scan_in_progress = True
-    started = time.monotonic()
-
-    try:
-
-        logger.info(
-            "================================================"
-        )
-
-        logger.info(
-            "DÉBUT SCAN MARCHÉS | 5 MINUTES"
-        )
-
-        for symbol in SYMBOLS:
-
-            try:
-
-                logger.info(
-                    "Analyse de %s...",
-                    symbol,
-                )
-
-                df, metadata = get_market_data(
-                    symbol
-                )
-
-                update_price_state(
-                    symbol,
-                    metadata,
-                )
-
-                signal = analyze_smc_pa_smv(
-                    df
-                )
-
-                if signal:
-
-                    logger.info(
-                        "SIGNAL VALIDÉ | %s | %s | "
-                        "Entry=%s | SL=%s | TP1=%s | TP2=%s",
-                        symbol,
-                        signal["direction"],
-                        format_price(
-                            symbol,
-                            signal["entry"],
-                        ),
-                        format_price(
-                            symbol,
-                            signal["sl"],
-                        ),
-                        format_price(
-                            symbol,
-                            signal["tp1"],
-                        ),
-                        format_price(
-                            symbol,
-                            signal["tp2"],
-                        ),
-                    )
-
-                    send_signal(
-                        symbol,
-                        signal,
-                        metadata["source"],
-                    )
-
-                else:
-
-                    logger.info(
-                        "Aucun signal valide pour %s.",
-                        symbol,
-                    )
-
-            except Exception as exc:
-
-                logger.exception(
-                    "Erreur pendant analyse %s : %s",
-                    symbol,
-                    exc,
-                )
-
-        with state_lock:
-            total_scans += 1
-            last_scan_at = utc_now()
-            last_scan_duration = (
-                time.monotonic() - started
-            )
-
-        logger.info(
-            "FIN SCAN | durée %.2fs",
-            time.monotonic() - started,
-        )
-
-        logger.info(
-            "================================================"
-        )
-
-    finally:
-
-        scan_in_progress = False
-        scan_lock.release()
-
-
-def start_immediate_scan() -> bool:
-
-    if scan_in_progress:
-
-        return False
-
-    thread = threading.Thread(
-        target=scan_markets,
-        name="ImmediateScan",
-        daemon=True,
+    telegram_send_message(
+        str(chat_id),
+        (
+            "🔐 *PANNEAU ADMIN*\n\n"
+            "Sélectionnez une action :"
+        ),
+        admin_keyboard(),
     )
 
-    thread.start()
-
-    return True
-
-
-# ============================================================
-# TELEGRAM ADMIN CALLBACKS
-# ============================================================
 
 def handle_callback_query(
     callback: Dict[str, Any],
 ) -> None:
 
-    callback_id = callback.get("id")
-
-    from_user = callback.get(
-        "from",
-        {},
+    callback_id = callback.get(
+        "id"
     )
 
-    user_id = from_user.get("id")
+    user_id = (
+        callback.get(
+            "from",
+            {},
+        ).get(
+            "id"
+        )
+    )
 
     data = callback.get(
         "data",
         "",
     )
 
-    if not is_admin(user_id):
+    if not is_admin(
+        user_id
+    ):
 
         telegram_answer_callback(
             callback_id,
@@ -1917,11 +3568,27 @@ def handle_callback_query(
         )
 
         logger.warning(
-            "Tentative accès admin refusée. "
-            "Utilisateur Telegram : %s",
+            "Clic admin refusé : %s",
             user_id,
         )
 
+        return
+
+    message_chat_id = (
+        callback.get(
+            "message",
+            {},
+        )
+        .get(
+            "chat",
+            {},
+        )
+        .get(
+            "id"
+        )
+    )
+
+    if not message_chat_id:
         return
 
     if data == "admin_status":
@@ -1931,25 +3598,11 @@ def handle_callback_query(
             "Statut actualisé.",
         )
 
-        message = build_admin_status()
-
-        message_chat = callback.get(
-            "message",
-            {},
-        ).get(
-            "chat",
-            {},
-        ).get(
-            "id"
+        telegram_send_message(
+            str(message_chat_id),
+            admin_status_text(),
+            admin_keyboard(),
         )
-
-        if message_chat:
-
-            telegram_send_message(
-                str(message_chat),
-                message,
-                admin_keyboard(),
-            )
 
         return
 
@@ -1960,122 +3613,47 @@ def handle_callback_query(
             "Prix actualisés.",
         )
 
-        message = build_admin_prices()
-
-        message_chat = callback.get(
-            "message",
-            {},
-        ).get(
-            "chat",
-            {},
-        ).get(
-            "id"
+        telegram_send_message(
+            str(message_chat_id),
+            admin_prices_text(),
+            admin_keyboard(),
         )
-
-        if message_chat:
-
-            telegram_send_message(
-                str(message_chat),
-                message,
-                admin_keyboard(),
-            )
 
         return
 
     if data == "admin_scan":
 
-        telegram_answer_callback(
-            callback_id,
-            "Scan immédiat lancé.",
-        )
-
         started = start_immediate_scan()
 
-        message_chat = callback.get(
-            "message",
-            {},
-        ).get(
-            "chat",
-            {},
-        ).get(
-            "id"
-        )
+        if started:
 
-        if message_chat:
-
-            if started:
-
-                message = (
-                    "🔄 *SCAN IMMÉDIAT LANCÉ*\n\n"
-                    "Le scan des 4 marchés vient "
-                    "d'être déclenché."
-                )
-
-            else:
-
-                message = (
-                    "⚠️ *SCAN DÉJÀ EN COURS*\n\n"
-                    "Aucun nouveau scan parallèle "
-                    "n'a été lancé."
-                )
-
-            telegram_send_message(
-                str(message_chat),
-                message,
-                admin_keyboard(),
+            telegram_answer_callback(
+                callback_id,
+                "Scan lancé.",
             )
 
-        return
-
-
-# ============================================================
-# TELEGRAM /admin
-# ============================================================
-
-def handle_admin_command(
-    message: Dict[str, Any],
-) -> None:
-
-    from_user = message.get(
-        "from",
-        {},
-    )
-
-    user_id = from_user.get("id")
-
-    chat = message.get(
-        "chat",
-        {},
-    )
-
-    chat_id = chat.get("id")
-
-    if not is_admin(user_id):
-
-        if chat_id:
-
-            telegram_send_message(
-                str(chat_id),
-                "⛔ *Accès refusé.*",
+            text = (
+                "🔄 *SCAN FORCÉ LANCÉ*\n\n"
+                "Les quatre actifs sont en cours d'analyse."
             )
 
-        logger.warning(
-            "Commande /admin refusée pour utilisateur %s",
-            user_id,
+        else:
+
+            telegram_answer_callback(
+                callback_id,
+                "Scan déjà en cours.",
+            )
+
+            text = (
+                "⚠️ *SCAN DÉJÀ EN COURS*\n\n"
+                "Aucun scan parallèle n'a été lancé."
+            )
+
+        telegram_send_message(
+            str(message_chat_id),
+            text,
+            admin_keyboard(),
         )
-
-        return
-
-    telegram_send_message(
-        str(chat_id),
-        (
-            "🔐 *PANNEAU ADMINISTRATION*\n\n"
-            "Bienvenue dans l'interface privée "
-            "du bot.\n\n"
-            "Sélectionnez une action :"
-        ),
-        admin_keyboard(),
-    )
 
 
 # ============================================================
@@ -2089,7 +3667,7 @@ def telegram_polling_loop() -> None:
     telegram_delete_webhook()
 
     logger.info(
-        "Thread Telegram propriétaire démarré."
+        "Thread Telegram démarré."
     )
 
     consecutive_errors = 0
@@ -2137,12 +3715,19 @@ def telegram_polling_loop() -> None:
             for update in updates:
 
                 telegram_offset = (
-                    int(update["update_id"]) + 1
+                    int(
+                        update[
+                            "update_id"
+                        ]
+                    )
+                    + 1
                 )
 
                 try:
 
-                    message = update.get("message")
+                    message = update.get(
+                        "message"
+                    )
 
                     if message:
 
@@ -2153,7 +3738,9 @@ def telegram_polling_loop() -> None:
                             )
                         ).strip()
 
-                        if text.startswith("/admin"):
+                        if text.startswith(
+                            "/admin"
+                        ):
 
                             handle_admin_command(
                                 message
@@ -2172,7 +3759,7 @@ def telegram_polling_loop() -> None:
                 except Exception as exc:
 
                     logger.exception(
-                        "Erreur traitement update Telegram : %s",
+                        "Erreur update Telegram : %s",
                         exc,
                     )
 
@@ -2187,16 +3774,259 @@ def telegram_polling_loop() -> None:
 
 
 # ============================================================
-# TRADING LOOP
+# SCAN COMPLET
+# ============================================================
+
+def scan_markets() -> None:
+
+    global scan_in_progress
+    global last_scan_at
+    global last_scan_duration
+    global total_scans
+
+    if not scan_lock.acquire(
+        blocking=False
+    ):
+
+        logger.warning(
+            "Un scan est déjà en cours."
+        )
+
+        return
+
+    scan_in_progress = True
+
+    started = time.monotonic()
+
+    try:
+
+        logger.info(
+            "===================================================="
+        )
+
+        logger.info(
+            "SCAN MULTI-TIMEFRAME | M15 + M5 + M1"
+        )
+
+        logger.info(
+            "===================================================="
+        )
+
+        # ----------------------------------------------------
+        # Récupération et analyse des quatre actifs.
+        # ----------------------------------------------------
+
+        for symbol in SYMBOLS:
+
+            try:
+
+                (
+                    m15,
+                    m5,
+                    m1,
+                    metadata,
+                ) = get_market_data(
+                    symbol
+                )
+
+                current_price = safe_float(
+                    metadata.get(
+                        "price"
+                    )
+                )
+
+                if current_price is None:
+                    continue
+
+                # État des prix pour l'admin
+                with state_lock:
+
+                    last_prices[
+                        symbol
+                    ] = {
+                        "source": metadata.get(
+                            "source"
+                        ),
+                        "price": current_price,
+                        "m15_price": metadata.get(
+                            "m15_price"
+                        ),
+                        "m5_price": metadata.get(
+                            "m5_price"
+                        ),
+                        "m1_price": metadata.get(
+                            "m1_price"
+                        ),
+                        "m1_volume": metadata.get(
+                            "m1_volume"
+                        ),
+                        "updated_at": utc_now(),
+                    }
+
+                # ------------------------------------------------
+                # Suivi des ordres existants.
+                # ------------------------------------------------
+
+                check_pending_orders()
+
+                check_breakeven()
+
+                # ------------------------------------------------
+                # Un seul signal par paire toutes les 60 min.
+                # ------------------------------------------------
+
+                if is_on_cooldown(
+                    symbol
+                ):
+
+                    logger.info(
+                        "%s : cooldown actif.",
+                        symbol,
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # Pas de nouveau setup si une LIMIT existe.
+                # ------------------------------------------------
+
+                with state_lock:
+
+                    has_pending = (
+                        symbol
+                        in pending_orders
+                    )
+
+                if has_pending:
+
+                    logger.info(
+                        "%s : ordre LIMIT déjà actif.",
+                        symbol,
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # ENTONNOIR SMC + PA + SMV.
+                # ------------------------------------------------
+
+                signal = analyze_market(
+                    symbol,
+                    m15,
+                    m5,
+                    m1,
+                    current_price,
+                )
+
+                if not signal:
+
+                    logger.info(
+                        "%s : aucun setup complet.",
+                        symbol,
+                    )
+
+                    continue
+
+                logger.info(
+                    (
+                        "SETUP VALIDÉ | %s | %s | "
+                        "Entry=%s | SL=%s | "
+                        "TP1=%s | TP2=%s"
+                    ),
+                    symbol,
+                    signal["order_type"],
+                    format_price(
+                        symbol,
+                        signal["entry"],
+                    ),
+                    format_price(
+                        symbol,
+                        signal["sl"],
+                    ),
+                    format_price(
+                        symbol,
+                        signal["tp1"],
+                    ),
+                    format_price(
+                        symbol,
+                        signal["tp2"],
+                    ),
+                )
+
+                send_new_signal(
+                    signal
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Erreur analyse %s : %s",
+                    symbol,
+                    exc,
+                )
+
+        # ----------------------------------------------------
+        # Suivi global après récupération des quatre actifs.
+        # ----------------------------------------------------
+
+        check_pending_orders()
+
+        check_breakeven()
+
+        with state_lock:
+
+            total_scans += 1
+            last_scan_at = utc_now()
+            last_scan_duration = (
+                time.monotonic()
+                - started
+            )
+
+        save_state()
+
+        logger.info(
+            "SCAN TERMINÉ | durée %.2fs",
+            time.monotonic() - started,
+        )
+
+    finally:
+
+        scan_in_progress = False
+
+        scan_lock.release()
+
+
+# ============================================================
+# SCAN IMMÉDIAT
+# ============================================================
+
+def start_immediate_scan() -> bool:
+
+    if scan_in_progress:
+        return False
+
+    thread = threading.Thread(
+        target=scan_markets,
+        name="ImmediateScan",
+        daemon=True,
+    )
+
+    thread.start()
+
+    return True
+
+
+# ============================================================
+# BOUCLE PRINCIPALE
 # ============================================================
 
 def trading_loop() -> None:
 
     logger.info(
-        "Thread principal de trading démarré."
+        "Boucle trading démarrée : cycle 60 secondes."
     )
 
-    # Premier scan immédiat au démarrage.
+    # Premier scan immédiatement.
     scan_markets()
 
     while True:
@@ -2204,6 +4034,12 @@ def trading_loop() -> None:
         cycle_started = time.monotonic()
 
         try:
+
+            # Vérification du cycle de vie des LIMIT
+            # même si une nouvelle collecte rencontre
+            # temporairement une erreur.
+            check_pending_orders()
+            check_breakeven()
 
             scan_markets()
 
@@ -2214,19 +4050,25 @@ def trading_loop() -> None:
                 exc,
             )
 
-        elapsed = time.monotonic() - cycle_started
+        elapsed = (
+            time.monotonic()
+            - cycle_started
+        )
 
-        sleep_for = max(
+        sleep_seconds = max(
             1,
-            SCAN_INTERVAL_SECONDS - elapsed,
+            SCAN_INTERVAL_SECONDS
+            - elapsed,
         )
 
         logger.info(
-            "Prochain scan dans %.0f secondes.",
-            sleep_for,
+            "Prochain cycle dans %s secondes.",
+            int(sleep_seconds),
         )
 
-        time.sleep(sleep_for)
+        time.sleep(
+            sleep_seconds
+        )
 
 
 # ============================================================
@@ -2237,12 +4079,27 @@ def main() -> None:
 
     validate_environment()
 
+    load_state()
+
     logger.info(
-        "================================================"
+        "===================================================="
     )
 
     logger.info(
-        "BOT TRADING SMC + PA + SMV"
+        "NOVA MULTI-TIMEFRAME TRADING BOT"
+    )
+
+    logger.info(
+        "Actifs : %s",
+        ", ".join(SYMBOLS),
+    )
+
+    logger.info(
+        "Timeframes : M15 / M5 / M1"
+    )
+
+    logger.info(
+        "Cycle : 60 secondes"
     )
 
     logger.info(
@@ -2250,22 +4107,27 @@ def main() -> None:
     )
 
     logger.info(
-        "Marchés : %s",
-        ", ".join(SYMBOLS),
+        "Cooldown : 60 minutes par paire"
     )
 
     logger.info(
-        "Timeframe : %s",
-        TIMEFRAME,
+        "Expiration LIMIT : 15 minutes"
     )
 
     logger.info(
-        "Intervalle scan : %s secondes",
-        SCAN_INTERVAL_SECONDS,
+        "Breakeven : RR 1:1.5"
     )
 
     logger.info(
-        "================================================"
+        "TP1 : RR 1:3"
+    )
+
+    logger.info(
+        "TP2 : RR 1:6"
+    )
+
+    logger.info(
+        "===================================================="
     )
 
     telegram_thread = threading.Thread(
@@ -2284,7 +4146,7 @@ def main() -> None:
 
     trading_thread.start()
 
-    # Le processus principal reste vivant sur Railway.
+    # Maintient le processus Railway vivant.
     while True:
 
         time.sleep(60)
