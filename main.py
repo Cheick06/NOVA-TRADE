@@ -8,6 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 from flask import Flask
@@ -2805,18 +2806,12 @@ def strategy_timestamp(value=None):
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def detect_pivots(
+def detect_structure_pivots(
     df,
     left=2,
     right=2
 ):
-    """
-    Détecte les pivots confirmés sans utiliser les bougies
-    situées après le pivot pour prendre une décision prématurée.
-
-    Un pivot high est le plus haut de sa fenêtre.
-    Un pivot low est le plus bas de sa fenêtre.
-    """
+    """Détecte les pivots utilisés par la structure SMC existante."""
 
     if df is None or df.empty:
         return []
@@ -2855,10 +2850,277 @@ def detect_pivots(
                 "timestamp": str(df["timestamp"].iloc[i])
             })
 
-    return sorted(
-        pivots,
-        key=lambda item: item["index"]
-    )
+    return sorted(pivots, key=lambda item: item["index"])
+
+
+def detect_pivots(df, window=5):
+    """
+    Détecte les fractals M15 majeurs de manière vectorisée.
+
+    Un pivot haut possède ``window`` bougies avec des plus hauts
+    inférieurs de chaque côté. Même principe inverse pour un pivot bas.
+    """
+
+    if df is None or df.empty:
+        empty = pd.DataFrame(columns=["index", "price"])
+        return {"highs": empty.copy(), "lows": empty.copy()}
+
+    window = int(window)
+    if window < 1:
+        raise ValueError("window doit être >= 1")
+
+    data = df.copy()
+    data.columns = [str(c).strip().lower() for c in data.columns]
+
+    required = {"high", "low", "close"}
+    if not required.issubset(data.columns):
+        raise ValueError("Le DataFrame doit contenir high, low et close")
+
+    high = pd.to_numeric(data["high"], errors="coerce")
+    low = pd.to_numeric(data["low"], errors="coerce")
+
+    span = 2 * window + 1
+    high_max = high.rolling(span, center=True, min_periods=span).max()
+    low_min = low.rolling(span, center=True, min_periods=span).min()
+
+    pivot_high = high.eq(high_max)
+    pivot_low = low.eq(low_min)
+
+    # Évite les doubles pivots consécutifs sur des plateaux de prix.
+    pivot_high &= high.gt(high.shift(1)) & high.gt(high.shift(-1))
+    pivot_low &= low.lt(low.shift(1)) & low.lt(low.shift(-1))
+
+    high_idx = np.flatnonzero(pivot_high.fillna(False).to_numpy())
+    low_idx = np.flatnonzero(pivot_low.fillna(False).to_numpy())
+
+    return {
+        "highs": pd.DataFrame({
+            "index": high_idx,
+            "price": high.iloc[high_idx].to_numpy(dtype=float)
+        }),
+        "lows": pd.DataFrame({
+            "index": low_idx,
+            "price": low.iloc[low_idx].to_numpy(dtype=float)
+        })
+    }
+
+
+# ==========================================
+# PHASE 1 — ZONES MAJEURES M15
+# ==========================================
+
+M15_ZONE_LOCK = threading.RLock()
+M15_ZONES = {symbol: [] for symbol in SYMBOLS}
+M15_ZONE_STATE = {
+    symbol: {"bias": None, "bos": None, "bos_level": None}
+    for symbol in SYMBOLS
+}
+
+M15_ZONE_BUFFER_PCT = {
+    "EURUSD": 0.0005,
+    "GBPUSD": 0.0005,
+    "XAUUSD": 0.0010,
+    "BTCUSD": 0.0030
+}
+M15_ZONE_ATR_PERIOD = 14
+M15_ZONE_ATR_MULTIPLIER = 0.50
+M15_ZONE_MIN_TOUCHES = 2
+
+
+def _m15_zone_atr(df, period=14):
+    previous_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - previous_close).abs(),
+        (df["low"] - previous_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=1).mean()
+
+
+def _m15_zone_width(price, atr_value, symbol):
+    pct_width = abs(float(price)) * M15_ZONE_BUFFER_PCT[symbol]
+    atr_width = (float(atr_value) * M15_ZONE_ATR_MULTIPLIER
+                 if np.isfinite(atr_value) and atr_value > 0 else 0.0)
+    return float(max(pct_width, atr_width))
+
+
+def _m15_zone_touch_count(df, level, width, level_type):
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+
+    zone_min = level - width
+    zone_max = level + width
+    intersects = (high >= zone_min) & (low <= zone_max)
+
+    if level_type == "SUPPORT":
+        reaction = close >= level
+    else:
+        reaction = close <= level
+
+    return int(np.count_nonzero(intersects & reaction))
+
+
+def _cluster_m15_pivots(levels, types, atr_value, symbol):
+    if not levels:
+        return []
+
+    order = np.argsort(np.asarray(levels, dtype=float))
+    sorted_levels = np.asarray(levels, dtype=float)[order]
+    sorted_types = np.asarray(types, dtype=object)[order]
+
+    clusters = []
+    current_levels = [float(sorted_levels[0])]
+    current_types = [str(sorted_types[0])]
+
+    for level, level_type in zip(sorted_levels[1:], sorted_types[1:]):
+        center = float(np.mean(current_levels))
+        width = _m15_zone_width(center, atr_value, symbol)
+        if abs(float(level) - center) <= width * 2.0:
+            current_levels.append(float(level))
+            current_types.append(str(level_type))
+        else:
+            clusters.append((
+                float(np.mean(current_levels)),
+                max(set(current_types), key=current_types.count)
+            ))
+            current_levels = [float(level)]
+            current_types = [str(level_type)]
+
+    clusters.append((
+        float(np.mean(current_levels)),
+        max(set(current_types), key=current_types.count)
+    ))
+    return clusters
+
+
+def build_m15_major_zones(df, symbol, window=5):
+    symbol = str(symbol).upper()
+    if symbol not in M15_ZONE_BUFFER_PCT:
+        raise ValueError(f"Symbole non supporté: {symbol}")
+
+    if df is None or df.empty:
+        return {"zones": [], "bias": None, "bos": None, "bos_level": None}
+
+    data = df.copy()
+    data.columns = [str(c).strip().lower() for c in data.columns]
+    for col in ("open", "high", "low", "close"):
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    data = data.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+
+    if len(data) < 2 * window + 1:
+        return {"zones": [], "bias": None, "bos": None, "bos_level": None}
+
+    atr_value = float(_m15_zone_atr(data, M15_ZONE_ATR_PERIOD).iloc[-1])
+    pivots = detect_pivots(data, window=window)
+
+    high_levels = pivots["highs"]["price"].tolist()
+    low_levels = pivots["lows"]["price"].tolist()
+    levels = high_levels + low_levels
+    types = (["RESISTANCE"] * len(high_levels)
+             + ["SUPPORT"] * len(low_levels))
+
+    zones = []
+    for level, level_type in _cluster_m15_pivots(levels, types, atr_value, symbol):
+        width = _m15_zone_width(level, atr_value, symbol)
+        touches = _m15_zone_touch_count(data, level, width, level_type)
+        if touches >= M15_ZONE_MIN_TOUCHES:
+            zones.append({
+                "level_type": level_type,
+                "zone_min": float(level - width),
+                "zone_max": float(level + width),
+                "touches": touches,
+                "is_active": True
+            })
+
+    # Biais global M15 : EMA20/EMA50 sur la dernière bougie clôturée.
+    closed = data.iloc[:-1] if len(data) > 1 else data
+    close_series = closed["close"]
+    ema20 = close_series.ewm(span=20, adjust=False, min_periods=1).mean().iloc[-1]
+    ema50 = close_series.ewm(span=50, adjust=False, min_periods=1).mean().iloc[-1]
+    bias = "BULLISH" if ema20 > ema50 else "BEARISH" if ema20 < ema50 else None
+
+    bos = None
+    bos_level = None
+    last_closed = data.iloc[-2] if len(data) > 1 else data.iloc[-1]
+
+    for idx, zone in enumerate(zones):
+        if zone["level_type"] == "RESISTANCE" and float(last_closed["close"]) > zone["zone_max"] and float(last_closed["close"]) >= float(last_closed["open"]):
+            zone["is_active"] = False
+            if bos is None or zone["zone_max"] > bos_level:
+                bos = "BULLISH_BOS"
+                bos_level = float(zone["zone_max"])
+        elif zone["level_type"] == "SUPPORT" and float(last_closed["close"]) < zone["zone_min"] and float(last_closed["close"]) <= float(last_closed["open"]):
+            zone["is_active"] = False
+            if bos is None or bos_level is None or zone["zone_min"] < bos_level:
+                bos = "BEARISH_BOS"
+                bos_level = float(zone["zone_min"])
+
+    return {
+        "zones": zones,
+        "bias": bias,
+        "bos": bos,
+        "bos_level": bos_level
+    }
+
+
+def update_m15_major_zones(df, symbol, window=5):
+    state = build_m15_major_zones(df, symbol, window)
+    symbol = str(symbol).upper()
+    with M15_ZONE_LOCK:
+        M15_ZONES[symbol] = [dict(zone) for zone in state["zones"]]
+        M15_ZONE_STATE[symbol] = {
+            "bias": state["bias"],
+            "bos": state["bos"],
+            "bos_level": state["bos_level"],
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+    return state
+
+
+def check_m15_zones(current_price, symbol):
+    symbol = str(symbol).upper()
+    price = float(current_price)
+    if symbol not in SYMBOLS or not np.isfinite(price):
+        return None
+
+    with M15_ZONE_LOCK:
+        zones = [dict(zone) for zone in M15_ZONES.get(symbol, [])]
+        state = dict(M15_ZONE_STATE.get(symbol, {}))
+
+    bias = state.get("bias")
+    for zone in zones:
+        if not zone.get("is_active") or int(zone.get("touches", 0)) < M15_ZONE_MIN_TOUCHES:
+            continue
+        if not (float(zone["zone_min"]) <= price <= float(zone["zone_max"])):
+            continue
+
+        if zone["level_type"] == "SUPPORT" and bias == "BULLISH":
+            direction = "HAUSSIER"
+        elif zone["level_type"] == "RESISTANCE" and bias == "BEARISH":
+            direction = "BAISSIER"
+        else:
+            continue
+
+        trigger = (float(zone["zone_min"]) + float(zone["zone_max"])) / 2.0
+        structure = {
+            "direction": direction,
+            "bos_price": trigger,
+            "bos_timestamp": strategy_timestamp(),
+            "trigger_price": trigger,
+            "trigger_type": zone["level_type"],
+            "trigger_timestamp": strategy_timestamp(),
+            "closed_timestamp": strategy_timestamp()
+        }
+        return create_pending_opportunity(symbol, direction, trigger, structure)
+
+    return None
+
+
+def get_m15_major_zones(symbol):
+    symbol = str(symbol).upper()
+    with M15_ZONE_LOCK:
+        return [dict(zone) for zone in M15_ZONES.get(symbol, [])]
 
 
 def _last_pivot_before(
@@ -2897,7 +3159,7 @@ def check_m15_structure(
     if df is None or len(df) < 20:
         return None
 
-    pivots = detect_pivots(
+    pivots = detect_structure_pivots(
         df,
         M15_PIVOT_LEFT,
         M15_PIVOT_RIGHT
@@ -3111,9 +3373,7 @@ def create_pending_opportunity(
 def scan_market_m15(
     symbol
 ):
-    """
-    Analyse M15 indépendante pour un seul symbole.
-    """
+    """Analyse les zones majeures M15 d'un seul actif."""
 
     try:
         df_m15 = fetch_biquote_ohlcv(
@@ -3124,47 +3384,39 @@ def scan_market_m15(
 
         if df_m15.empty or len(df_m15) < 30:
             logging.warning(
-                f"[M15] Données insuffisantes pour {symbol}."
+                f"[M15 ZONES] Données insuffisantes pour {symbol}."
             )
             return
 
-        structure = check_m15_structure(
-            df_m15
+        state = update_m15_major_zones(
+            df_m15,
+            symbol,
+            window=5
         )
 
-        if structure is None:
-            logging.info(
-                f"[M15] Aucun BOS exploitable pour {symbol}."
-            )
-            return
-
-        current_price = float(
-            df_m15["close"].iloc[-1]
-        )
-
-        trigger_price = float(
-            structure["trigger_price"]
-        )
-
-        if not _price_is_near_level(
+        current_price = float(df_m15["close"].iloc[-1])
+        opportunity = check_m15_zones(
             current_price,
-            trigger_price,
-            M15_TRIGGER_PROXIMITY_PCT
-        ):
-            return
-
-        create_pending_opportunity(
-            symbol=symbol,
-            direction=structure["direction"],
-            trigger_price=trigger_price,
-            m15_structure=structure
+            symbol
         )
+
+        logging.info(
+            f"[M15 ZONES] {symbol} | zones={len(state['zones'])} | "
+            f"actives={sum(1 for z in state['zones'] if z['is_active'])} | "
+            f"bias={state['bias']} | BOS={state['bos']} | "
+            f"price={current_price:.8f}"
+        )
+
+        if opportunity:
+            logging.info(
+                f"[M15 ZONES] {symbol} | opportunité créée | "
+                f"{opportunity}"
+            )
 
     except Exception as e:
         logging.exception(
-            f"[M15] Erreur scan {symbol}: {e}"
+            f"[M15 ZONES] Erreur scan {symbol}: {e}"
         )
-
 
 def _last_closed_timestamp(
     df
@@ -3287,7 +3539,7 @@ def check_m1_choch(
     if df is None or len(df) < 10:
         return None
 
-    pivots = detect_pivots(
+    pivots = detect_structure_pivots(
         df,
         M1_PIVOT_LEFT,
         M1_PIVOT_RIGHT
@@ -3428,7 +3680,7 @@ def check_m1_bos(
     if df is None or len(df) < 12:
         return None
 
-    pivots = detect_pivots(
+    pivots = detect_structure_pivots(
         df,
         M1_PIVOT_LEFT,
         M1_PIVOT_RIGHT
