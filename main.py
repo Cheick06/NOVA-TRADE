@@ -345,6 +345,17 @@ def telegram_validate_and_prepare():
     return False
 
 
+def format_telegram_price(symbol, price):
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return str(price)
+
+    symbol = str(symbol).upper()
+    decimals = 5 if symbol in ("EURUSD", "GBPUSD") else 2
+    return f"{value:.{decimals}f}"
+
+
 def send_telegram_message(
     message,
     reply_markup=None
@@ -3720,14 +3731,13 @@ def execute_m1_order(
 
     message = (
         f"{'🟢' if trade['direction'] == 'BUY' else '🔴'} "
-        f"*{direction_text} {symbol}*\n"
-        f"Direction : {direction_text}\n"
-        f"Entrée OB M1 : `{entry:.8f}`\n"
-        f"SL : `{sl:.8f}`\n"
-        f"TP1 : `{tp1:.8f}`\n"
-        f"TP2 : `{tp2:.8f}`\n"
-        f"TP3 : `{tp3:.8f}`\n"
-        f"RR TP3 : `1:{rr:.2f}`"
+        f"*{direction_text} — {symbol}*\n\n"
+        f"🎯 Entrée : {format_telegram_price(symbol, entry)}\n"
+        f"🛑 SL : {format_telegram_price(symbol, sl)}\n\n"
+        f"TP1 : {format_telegram_price(symbol, tp1)}\n"
+        f"TP2 : {format_telegram_price(symbol, tp2)}\n"
+        f"TP3 : {format_telegram_price(symbol, tp3)}\n\n"
+        f"⚖️ RR : 1:{rr:.2f}"
     )
 
     if send_telegram_message(message):
@@ -4261,7 +4271,7 @@ def track_active_trades():
                             send_telegram_message(
                                 f"🟢 *Ordre limite exécuté* — "
                                 f"{symbol}\n"
-                                f"Entrée : `{entry:.8f}`"
+                                f"Entrée : `{format_telegram_price(symbol, entry)}`"
                             )
 
                         continue
@@ -4293,7 +4303,7 @@ def track_active_trades():
                                 )
                                 send_telegram_message(
                                     f"🎯 *TP1 atteint* — {symbol}\n"
-                                    f"Prix : `{current_price:.8f}`"
+                                    f"Prix : `{format_telegram_price(symbol, current_price)}`"
                                 )
 
                             if not tp2_hit and current_price >= tp2:
@@ -4305,7 +4315,7 @@ def track_active_trades():
                                 )
                                 send_telegram_message(
                                     f"🎯 *TP2 atteint* — {symbol}\n"
-                                    f"Prix : `{current_price:.8f}`"
+                                    f"Prix : `{format_telegram_price(symbol, current_price)}`"
                                 )
 
                             if not tp3_hit and current_price >= tp3:
@@ -4354,7 +4364,7 @@ def track_active_trades():
                                 )
                                 send_telegram_message(
                                     f"🎯 *TP1 atteint* — {symbol}\n"
-                                    f"Prix : `{current_price:.8f}`"
+                                    f"Prix : `{format_telegram_price(symbol, current_price)}`"
                                 )
 
                             if not tp2_hit and current_price <= tp2:
@@ -4366,7 +4376,7 @@ def track_active_trades():
                                 )
                                 send_telegram_message(
                                     f"🎯 *TP2 atteint* — {symbol}\n"
-                                    f"Prix : `{current_price:.8f}`"
+                                    f"Prix : `{format_telegram_price(symbol, current_price)}`"
                                 )
 
                             if not tp3_hit and current_price <= tp3:
