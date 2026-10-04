@@ -1,4 +1,5 @@
 import os
+import asyncio
 import time
 import json
 import logging
@@ -49,6 +50,7 @@ TRADES_FILE = "active_trades.json"
 SIGNALS_FILE = "processed_signals.json"
 TRADE_HISTORY_FILE = "trade_history.json"
 WEEKLY_REPORTS_FILE = "weekly_reports.json"
+DAILY_TRACKER_FILE = "daily_tracker.json"
 
 # Opportunités M15 en attente de surveillance M5/M1
 OPPORTUNITIES_FILE = "pending_opportunities.json"
@@ -1875,6 +1877,81 @@ def telegram_polling_loop():
 # PERSISTANCE JSON THREAD-SAFE
 # ==========================================
 
+
+def is_trading_session(now=None):
+    try:
+        current = now or datetime.now(timezone.utc)
+        if current.weekday() >= 5:
+            return False
+        minutes = current.hour * 60 + current.minute
+        return 7 * 60 <= minutes < 17 * 60
+    except Exception as exc:
+        logging.exception(f"[SESSION] Erreur filtre horaire: {exc}")
+        return False
+
+
+def _daily_tracker_state():
+    today = datetime.now(timezone.utc).date().isoformat()
+    with JSON_LOCK:
+        tracker = load_json(DAILY_TRACKER_FILE)
+        if not isinstance(tracker, dict) or tracker.get("date") != today:
+            tracker = {"date": today, "locked_pairs": {}}
+            save_json(DAILY_TRACKER_FILE, tracker)
+        if not isinstance(tracker.get("locked_pairs"), dict):
+            tracker["locked_pairs"] = {}
+            save_json(DAILY_TRACKER_FILE, tracker)
+        return tracker
+
+
+def is_pair_locked_today(symbol):
+    try:
+        tracker = _daily_tracker_state()
+        return str(symbol).upper() in tracker.get("locked_pairs", {})
+    except Exception as exc:
+        logging.exception(f"[DAILY] Erreur lecture verrou {symbol}: {exc}")
+        return True
+
+
+def lock_pair_for_today(symbol, trade_id=None):
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+        with JSON_LOCK:
+            tracker = load_json(DAILY_TRACKER_FILE)
+            if not isinstance(tracker, dict) or tracker.get("date") != today:
+                tracker = {"date": today, "locked_pairs": {}}
+            locked = tracker.setdefault("locked_pairs", {})
+            locked[str(symbol).upper()] = {
+                "date": today,
+                "trade_id": trade_id,
+                "locked_at": strategy_timestamp(),
+            }
+            save_json(DAILY_TRACKER_FILE, tracker)
+        return True
+    except Exception as exc:
+        logging.exception(f"[DAILY] Impossible de verrouiller {symbol}: {exc}")
+        return False
+
+
+def pip_size(symbol):
+    symbol = str(symbol).upper()
+    if symbol in ("EURUSD", "GBPUSD"):
+        return 0.0001
+    if symbol == "XAUUSD":
+        return 0.01
+    return 0.01
+
+
+def calculate_pip_metrics(symbol, entry, stop_loss, tp3):
+    try:
+        size = pip_size(symbol)
+        risk_pips = abs(float(entry) - float(stop_loss)) / size
+        reward_pips = abs(float(tp3) - float(entry)) / size
+        rr = reward_pips / risk_pips if risk_pips > 0 else 0.0
+        return float(risk_pips), float(reward_pips), float(rr)
+    except Exception as exc:
+        logging.exception(f"[PIPS] Erreur calcul pips {symbol}: {exc}")
+        return 0.0, 0.0, 0.0
+
 def load_json(filename):
     with JSON_LOCK:
         if not os.path.exists(filename):
@@ -3373,9 +3450,10 @@ def create_pending_opportunity(
 def scan_market_m15(
     symbol
 ):
-    """Analyse les zones majeures M15 d'un seul actif."""
-
+    """Analyse M15 uniquement pendant la fenêtre Londres/New York."""
     try:
+        if not is_trading_session() or is_pair_locked_today(symbol):
+            return
         df_m15 = fetch_biquote_ohlcv(
             symbol,
             timeframe="15m",
@@ -3525,95 +3603,60 @@ def _find_last_opposite_pivot(
     return candidates[-1] if candidates else None
 
 
-def check_m1_choch(
-    df,
-    opp
-):
-    """
-    Détection du CHoCH M1 après la liquidité M5.
+def check_m1_choch(df, opp):
+    """Détecte le CHoCH M1 et calcule le SL structurel absolu entre la liquidité M5 et le CHoCH."""
+    try:
+        if df is None or len(df) < 10:
+            return None
+        pivots = detect_structure_pivots(df, M1_PIVOT_LEFT, M1_PIVOT_RIGHT)
+        if not pivots:
+            return None
+        closed_index = len(df) - 2
+        candle = df.iloc[closed_index]
+        close = float(candle["close"])
+        direction = str(opp["direction"]).upper()
+        m5_timestamp = opp.get("m5_liquidity_timestamp")
+        eligible = [p for p in pivots if not m5_timestamp or str(p["timestamp"]) >= str(m5_timestamp)]
+        if direction == "HAUSSIER":
+            candidates = [p for p in eligible if p["type"] == "HIGH" and p["index"] < closed_index]
+            if not candidates:
+                return None
+            broken = candidates[-1]
+            if close <= broken["price"]:
+                return None
+        else:
+            candidates = [p for p in eligible if p["type"] == "LOW" and p["index"] < closed_index]
+            if not candidates:
+                return None
+            broken = candidates[-1]
+            if close >= broken["price"]:
+                return None
 
-    Le niveau cassé est le dernier pivot local opposé.
-    Le SL est le dernier pivot local dans le sens du retracement.
-    """
-
-    if df is None or len(df) < 10:
+        start_idx = 0
+        if m5_timestamp:
+            ts = df["timestamp"].astype(str)
+            matches = [i for i, value in enumerate(ts) if value >= str(m5_timestamp)]
+            if matches:
+                start_idx = matches[0]
+        end_idx = closed_index
+        if start_idx > end_idx:
+            return None
+        segment = df.iloc[start_idx:end_idx + 1]
+        if segment.empty:
+            return None
+        structural_sl = float(segment["low"].min()) if direction == "HAUSSIER" else float(segment["high"].max())
+        return {
+            "timestamp": str(candle["timestamp"]),
+            "broken_level": float(broken["price"]),
+            "sl": structural_sl,
+            "sl_timestamp": str(candle["timestamp"]),
+            "pivot_index": int(broken["index"]),
+            "m5_liquidity_index": int(start_idx),
+            "m1_choch_index": int(end_idx),
+        }
+    except Exception as exc:
+        logging.exception(f"[M1-CHOCH] Erreur: {exc}")
         return None
-
-    pivots = detect_structure_pivots(
-        df,
-        M1_PIVOT_LEFT,
-        M1_PIVOT_RIGHT
-    )
-
-    if not pivots:
-        return None
-
-    closed_index = len(df) - 2
-    candle = df.iloc[closed_index]
-    close = float(candle["close"])
-
-    direction = opp["direction"]
-
-    m5_timestamp = opp.get("m5_liquidity_timestamp")
-
-    if m5_timestamp:
-        eligible_pivots = [
-            p for p in pivots
-            if str(p["timestamp"]) > str(m5_timestamp)
-        ]
-    else:
-        eligible_pivots = pivots
-
-    if direction == "HAUSSIER":
-        candidates = [
-            p for p in eligible_pivots
-            if p["type"] == "HIGH"
-            and p["index"] < closed_index
-        ]
-        if not candidates:
-            return None
-
-        broken = candidates[-1]
-
-        if close <= broken["price"]:
-            return None
-
-        sl_pivot = _find_last_opposite_pivot(
-            eligible_pivots,
-            direction,
-            closed_index
-        )
-
-    else:
-        candidates = [
-            p for p in eligible_pivots
-            if p["type"] == "LOW"
-            and p["index"] < closed_index
-        ]
-        if not candidates:
-            return None
-
-        broken = candidates[-1]
-
-        if close >= broken["price"]:
-            return None
-
-        sl_pivot = _find_last_opposite_pivot(
-            eligible_pivots,
-            direction,
-            closed_index
-        )
-
-    if sl_pivot is None:
-        return None
-
-    return {
-        "timestamp": str(candle["timestamp"]),
-        "broken_level": float(broken["price"]),
-        "sl": float(sl_pivot["price"]),
-        "sl_timestamp": str(sl_pivot["timestamp"]),
-        "pivot_index": int(broken["index"])
-    }
 
 
 def _find_order_block(
@@ -3669,182 +3712,109 @@ def _find_order_block(
     return None
 
 
-def check_m1_bos(
-    df,
-    opp
-):
-    """
-    Après CHoCH, recherche un nouveau pivot puis sa cassure.
-    """
+def _find_recent_fvg(df, bos_index, direction, lookback=4):
+    try:
+        first = max(2, bos_index - lookback)
+        last = bos_index - 1
+        for i in range(last, first - 1, -1):
+            a = df.iloc[i - 2]
+            c = df.iloc[i]
+            if direction == "HAUSSIER" and float(c["low"]) > float(a["high"]):
+                return {"index": i, "type": "FVG_HAUSSIER", "lower": float(a["high"]), "upper": float(c["low"]), "entry": float(c["low"]), "timestamp": str(c["timestamp"])}
+            if direction == "BAISSIER" and float(c["high"]) < float(a["low"]):
+                return {"index": i, "type": "FVG_BAISSIER", "lower": float(c["high"]), "upper": float(a["low"]), "entry": float(c["high"]), "timestamp": str(c["timestamp"])}
+    except Exception as exc:
+        logging.exception(f"[FVG] Erreur détection: {exc}")
+    return None
 
-    if df is None or len(df) < 12:
-        return None
 
-    pivots = detect_structure_pivots(
-        df,
-        M1_PIVOT_LEFT,
-        M1_PIVOT_RIGHT
-    )
-
-    if not pivots:
-        return None
-
-    choch_timestamp = str(
-        opp.get("m1_choch_timestamp")
-    )
-
-    closed_df = df.iloc[:-1].copy()
-
-    choch_positions = [
-        i
-        for i, value in enumerate(
-            closed_df["timestamp"].astype(str)
-        )
-        if value == choch_timestamp
-    ]
-
-    if not choch_positions:
-        return None
-
-    choch_index = choch_positions[-1]
-    closed_index = len(df) - 2
-    direction = opp["direction"]
-
-    if direction == "HAUSSIER":
-        candidates = [
-            p
-            for p in pivots
-            if p["type"] == "HIGH"
-            and choch_index < p["index"] < closed_index
-        ]
-
-        if not candidates:
+def check_m1_bos(df, opp):
+    try:
+        if df is None or len(df) < 12:
             return None
-
+        pivots = detect_structure_pivots(df, M1_PIVOT_LEFT, M1_PIVOT_RIGHT)
+        if not pivots:
+            return None
+        choch_timestamp = str(opp.get("m1_choch_timestamp"))
+        closed_df = df.iloc[:-1].copy()
+        positions = [i for i, value in enumerate(closed_df["timestamp"].astype(str)) if value == choch_timestamp]
+        if not positions:
+            return None
+        choch_index = positions[-1]
+        closed_index = len(df) - 2
+        direction = str(opp["direction"]).upper()
+        if direction == "HAUSSIER":
+            candidates = [p for p in pivots if p["type"] == "HIGH" and choch_index < p["index"] < closed_index]
+            if not candidates or float(df["close"].iloc[closed_index]) <= candidates[-1]["price"]:
+                return None
+        else:
+            candidates = [p for p in pivots if p["type"] == "LOW" and choch_index < p["index"] < closed_index]
+            if not candidates or float(df["close"].iloc[closed_index]) >= candidates[-1]["price"]:
+                return None
         target = candidates[-1]
-
-        if float(df["close"].iloc[closed_index]) <= target["price"]:
+        fvg = _find_recent_fvg(df, target["index"], direction, 4)
+        order_block = _find_order_block(df, target["index"], direction)
+        if fvg is not None:
+            entry = float(fvg["entry"])
+            entry_source = "FVG"
+        elif order_block is not None:
+            entry = float(order_block["open"])
+            entry_source = "ORDER_BLOCK"
+        else:
             return None
-
-    else:
-        candidates = [
-            p
-            for p in pivots
-            if p["type"] == "LOW"
-            and choch_index < p["index"] < closed_index
-        ]
-
-        if not candidates:
+        sl = float(opp["m1_sl"])
+        if (direction == "HAUSSIER" and sl >= entry) or (direction == "BAISSIER" and sl <= entry):
             return None
-
-        target = candidates[-1]
-
-        if float(df["close"].iloc[closed_index]) >= target["price"]:
-            return None
-
-    order_block = _find_order_block(
-        df,
-        target["index"],
-        direction
-    )
-
-    if order_block is None:
+        return {
+            "timestamp": str(df["timestamp"].iloc[closed_index]),
+            "bos_level": float(target["price"]),
+            "bos_pivot_timestamp": str(target["timestamp"]),
+            "order_block": order_block,
+            "fvg": fvg,
+            "entry_price": entry,
+            "entry_source": entry_source,
+            "sl": sl,
+        }
+    except Exception as exc:
+        logging.exception(f"[M1-BOS] Erreur: {exc}")
         return None
 
-    entry = float(
-        order_block["open"]
-    )
 
-    sl = float(
-        opp["m1_sl"]
-    )
-
-    if direction == "HAUSSIER":
-        if sl >= entry:
+def calculate_take_profits(direction, entry_price, stop_loss, df_m15):
+    try:
+        direction = str(direction).strip().upper()
+        entry_price = float(entry_price); stop_loss = float(stop_loss)
+        if direction not in ("HAUSSIER", "BAISSIER") or df_m15 is None or df_m15.empty:
             return None
-    else:
-        if sl <= entry:
+        recent = df_m15.tail(12).copy()
+        if len(recent) < 12:
             return None
-
-    return {
-        "timestamp": str(
-            df["timestamp"].iloc[closed_index]
-        ),
-        "bos_level": float(target["price"]),
-        "bos_pivot_timestamp": str(
-            target["timestamp"]
-        ),
-        "order_block": order_block,
-        "entry_price": entry,
-        "sl": sl
-    }
-
-
-def calculate_take_profits(
-    direction: str,
-    entry_price: float,
-    stop_loss: float,
-    df_m15: pd.DataFrame
-) -> dict:
-    direction = str(direction).strip().upper()
-
-    if direction not in ("HAUSSIER", "BAISSIER"):
-        raise ValueError("Direction invalide.")
-
-    if df_m15 is None or df_m15.empty:
-        raise ValueError("Données M15 insuffisantes.")
-
-    if not {"high", "low"}.issubset(df_m15.columns):
-        raise ValueError("Les colonnes 'high' et 'low' sont requises.")
-
-    entry_price = float(entry_price)
-    stop_loss = float(stop_loss)
-
-    if not math.isfinite(entry_price) or not math.isfinite(stop_loss):
-        raise ValueError("Prix invalides.")
-
-    high = pd.to_numeric(df_m15["high"], errors="coerce").dropna()
-    low = pd.to_numeric(df_m15["low"], errors="coerce").dropna()
-
-    if high.empty or low.empty:
-        raise ValueError("Données M15 high/low insuffisantes.")
-
-    if direction == "HAUSSIER":
-        if stop_loss >= entry_price:
-            raise ValueError("SL invalide pour une position HAUSSIER.")
-
-        risk = entry_price - stop_loss
-        tp1 = entry_price + risk
-        tp3 = float(high.max()) * (1.0 - 0.0002)
+        highs = pd.to_numeric(recent["high"], errors="coerce").dropna()
+        lows = pd.to_numeric(recent["low"], errors="coerce").dropna()
+        if direction == "HAUSSIER":
+            if stop_loss >= entry_price: return None
+            risk = entry_price - stop_loss
+            tp1 = entry_price + risk
+            tp3 = float(highs.max()) * 0.9998
+            reward = tp3 - entry_price
+        else:
+            if stop_loss <= entry_price: return None
+            risk = stop_loss - entry_price
+            tp1 = entry_price - risk
+            tp3 = float(lows.min()) * 1.0002
+            reward = entry_price - tp3
+        if risk <= 0 or reward <= 0:
+            return None
+        rr = reward / risk
+        if rr < 3.0:
+            return None
         tp2 = (tp1 + tp3) / 2.0
-        reward = tp3 - entry_price
-        rr_tp3 = reward / risk
-
-    else:
-        if stop_loss <= entry_price:
-            raise ValueError("SL invalide pour une position BAISSIER.")
-
-        risk = stop_loss - entry_price
-        tp1 = entry_price - risk
-        tp3 = float(low.min()) * (1.0 + 0.0002)
-        tp2 = (tp1 + tp3) / 2.0
-        reward = entry_price - tp3
-        rr_tp3 = reward / risk
-
-    if not all(math.isfinite(value) for value in (tp1, tp2, tp3, rr_tp3)):
-        raise ValueError("Niveaux TP invalides.")
-
-    if rr_tp3 < 3.0:
-        raise ValueError(
-            f"Trade annulé : RR TP3 = {rr_tp3:.2f}, inférieur au minimum 1:3."
-        )
-
-    return {
-        "tp1": float(tp1),
-        "tp2": float(tp2),
-        "tp3": float(tp3),
-        "rr_tp3": float(rr_tp3),
-    }
+        if not all(math.isfinite(x) for x in (tp1,tp2,tp3,rr)):
+            return None
+        return {"tp1": float(tp1), "tp2": float(tp2), "tp3": float(tp3), "rr_tp3": float(rr), "swing_lookback": 12}
+    except Exception as exc:
+        logging.exception(f"[TP] Erreur calcul TP: {exc}")
+        return None
 
 
 def _build_active_trade(
@@ -3870,17 +3840,14 @@ def _build_active_trade(
         )
         return None
 
-    try:
-        tp_levels = calculate_take_profits(
-            direction=direction,
-            entry_price=entry,
-            stop_loss=sl,
-            df_m15=df_m15
-        )
-    except ValueError as exc:
-        logging.info(
-            f"[M1] {symbol} {direction}: trade invalidé — {exc}"
-        )
+    tp_levels = calculate_take_profits(
+        direction=direction,
+        entry_price=entry,
+        stop_loss=sl,
+        df_m15=df_m15
+    )
+    if tp_levels is None:
+        logging.info(f"[M1] {symbol} {direction}: trade invalidé — RR TP3 < 1:3 ou niveaux invalides.")
         return None
 
     if direction == "HAUSSIER":
@@ -3893,7 +3860,8 @@ def _build_active_trade(
         f"{int(time.time() * 1000)}"
     )
 
-    order_block = execution["order_block"]
+    order_block = execution.get("order_block")
+    risk_pips, reward_pips, rr_pips = calculate_pip_metrics(symbol, entry, sl, tp_levels["tp3"])
 
     return trade_id, {
         "symbol": symbol,
@@ -3906,6 +3874,11 @@ def _build_active_trade(
         "tp3": tp_levels["tp3"],
         "tp": tp_levels["tp3"],
         "rr_theoretical": tp_levels["rr_tp3"],
+        "risk_pips": risk_pips,
+        "reward_pips": reward_pips,
+        "rr_pips": rr_pips,
+        "entry_source": execution.get("entry_source"),
+        "fvg": execution.get("fvg"),
         "tp1_hit": False,
         "tp2_hit": False,
         "tp3_hit": False,
@@ -3921,89 +3894,45 @@ def _build_active_trade(
     }
 
 
-def execute_m1_order(
-    candidate_id,
-    opp,
-    execution
-):
-    """
-    Enregistre le limit simulé dans active_trades.json.
-    L'alerte Telegram est envoyée uniquement après sauvegarde réussie.
-    """
-
-    result = _build_active_trade(
-        candidate_id,
-        opp,
-        execution
-    )
-
-    if result is None:
-        return False
-
-    trade_id, trade = result
-
-    with MARKET_EXECUTION_LOCK:
-        with JSON_LOCK:
-            active_trades = load_json(
-                TRADES_FILE
-            )
-
-            for existing in active_trades.values():
-                if (
-                    existing.get("candidate_id")
-                    == candidate_id
-                ):
+def execute_m1_order(candidate_id, opp, execution):
+    try:
+        symbol = str(opp.get("symbol", "")).upper()
+        if symbol not in SYMBOLS or not is_trading_session() or is_pair_locked_today(symbol):
+            return False
+        result = _build_active_trade(candidate_id, opp, execution)
+        if result is None:
+            _delete_opportunity(candidate_id)
+            return False
+        trade_id, trade = result
+        with MARKET_EXECUTION_LOCK:
+            with JSON_LOCK:
+                active_trades = load_json(TRADES_FILE)
+                if any(existing.get("candidate_id") == candidate_id for existing in active_trades.values()):
                     return False
-
-            active_trades[trade_id] = trade
-            save_json(
-                TRADES_FILE,
-                active_trades
-            )
-
-        ensure_trade_history_record(
-            trade_id,
-            trade
-        )
-
-    entry = float(trade["entry_price"])
-    sl = float(trade["initial_sl"])
-    tp1 = float(trade["tp1"])
-    tp2 = float(trade["tp2"])
-    tp3 = float(trade["tp3"])
-    rr = float(trade["rr_theoretical"])
-
-    direction_text = (
-        "ACHAT"
-        if trade["direction"] == "BUY"
-        else "VENTE"
-    )
-
-    symbol = trade["symbol"]
-
-    message = (
-        f"{'🟢' if trade['direction'] == 'BUY' else '🔴'} "
-        f"*{direction_text} — {symbol}*\n\n"
-        f"🎯 Entrée : {format_telegram_price(symbol, entry)}\n"
-        f"🛑 SL : {format_telegram_price(symbol, sl)}\n\n"
-        f"TP1 : {format_telegram_price(symbol, tp1)}\n"
-        f"TP2 : {format_telegram_price(symbol, tp2)}\n"
-        f"TP3 : {format_telegram_price(symbol, tp3)}\n\n"
-        f"⚖️ RR : 1:{rr:.2f}"
-    )
-
-    if send_telegram_message(message):
-        logging.info(
-            f"[EXECUTION] {trade_id} enregistré et "
-            f"alerte Telegram envoyée."
-        )
-    else:
-        logging.error(
-            f"[EXECUTION] {trade_id} enregistré, "
-            f"mais Telegram n'a pas confirmé l'envoi."
-        )
-
-    return True
+                active_trades[trade_id] = trade
+                save_json(TRADES_FILE, active_trades)
+            ensure_trade_history_record(trade_id, trade)
+        direction_text = "ACHAT" if trade["direction"] == "BUY" else "VENTE"
+        message = (f"{'🟢' if trade['direction']=='BUY' else '🔴'} {direction_text} — {symbol}\n\n"
+                   f"Entrée : {format_telegram_price(symbol, trade['entry_price'])}\n"
+                   f"SL absolu : {format_telegram_price(symbol, trade['initial_sl'])}\n"
+                   f"TP1 : {format_telegram_price(symbol, trade['tp1'])}\n"
+                   f"TP2 : {format_telegram_price(symbol, trade['tp2'])}\n"
+                   f"TP3 : {format_telegram_price(symbol, trade['tp3'])}\n"
+                   f"RR théorique : 1:{trade['rr_pips']:.2f}\n"
+                   f"Risque : {trade['risk_pips']:.1f} pips | Gain TP3 : {trade['reward_pips']:.1f} pips")
+        if not send_telegram_message(message):
+            logging.error(f"[EXECUTION] {trade_id}: Telegram non confirmé; paire non verrouillée.")
+            return False
+        if not lock_pair_for_today(symbol, trade_id):
+            logging.error(f"[DAILY] {symbol}: trade envoyé mais verrou quotidien non confirmé.")
+            return True
+        _delete_opportunity(candidate_id)
+        logging.info(f"[EXECUTION] {trade_id} envoyé et {symbol} verrouillé pour la journée.")
+        return True
+    except Exception as exc:
+        logging.exception(f"[EXECUTION] Erreur {candidate_id}: {exc}")
+        return False
 
 
 def _stage_age_expired(
@@ -4106,6 +4035,8 @@ def _process_pending_opportunity(
     status = opportunity.get("status")
 
     try:
+        if not is_trading_session() or is_pair_locked_today(symbol):
+            return
         if status == "WAITING_M5_LIQUIDITY":
             df_m5 = fetch_biquote_ohlcv(
                 symbol,
@@ -4391,61 +4322,36 @@ def scan_all_symbols_m15():
 # SCHEDULER MULTI-TIMEFRAME
 # ==========================================
 
-def main_scheduler():
-    logging.info(
-        "Thread scheduler SMC multi-timeframe démarré."
-    )
-
+async def _async_market_scheduler():
     last_m15_slot = None
     last_m5_slot = None
-
     while True:
         try:
             now = datetime.now(timezone.utc)
+            if is_trading_session(now):
+                m15_slot = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+                if now.second >= 5 and m15_slot != last_m15_slot:
+                    await asyncio.to_thread(scan_all_symbols_m15)
+                    last_m15_slot = m15_slot
+                m5_slot = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+                if now.second >= 5 and m5_slot != last_m5_slot:
+                    await asyncio.to_thread(scan_pending_opportunities_m5)
+                    last_m5_slot = m5_slot
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.exception(f"[SCHEDULER] Erreur: {exc}")
+            await asyncio.sleep(5)
 
-            m15_slot = now.replace(
-                minute=(now.minute // 15) * 15,
-                second=0,
-                microsecond=0
-            )
 
-            if (
-                now.second >= 5
-                and m15_slot != last_m15_slot
-            ):
-                logging.info(
-                    "[SCHEDULER] Scan M15 parallèle des 4 actifs."
-                )
+def main_scheduler():
+    logging.info("Scheduler asynchrone SMC démarré — session UTC 07:00-17:00.")
+    try:
+        asyncio.run(_async_market_scheduler())
+    except Exception as exc:
+        logging.exception(f"[SCHEDULER] Arrêt inattendu: {exc}")
 
-                scan_all_symbols_m15()
-
-                last_m15_slot = m15_slot
-
-            m5_slot = now.replace(
-                minute=(now.minute // 5) * 5,
-                second=0,
-                microsecond=0
-            )
-
-            if (
-                now.second >= 5
-                and m5_slot != last_m5_slot
-            ):
-                logging.info(
-                    "[SCHEDULER] Scan M5/M1 parallèle des opportunités."
-                )
-
-                scan_pending_opportunities_m5()
-
-                last_m5_slot = m5_slot
-
-            time.sleep(1)
-
-        except Exception as e:
-            logging.exception(
-                f"Erreur scheduler SMC multi-timeframe: {e}"
-            )
-            time.sleep(5)
 
 # ==========================================
 # SUIVI DES TRADES
