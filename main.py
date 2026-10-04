@@ -1879,14 +1879,7 @@ def telegram_polling_loop():
 
 
 def is_trading_session(now=None):
-    try:
-        current = now or datetime.now(timezone.utc)
-        if current.weekday() >= 5:
-            return False
-        minutes = current.hour * 60 + current.minute
-        return 7 * 60 <= minutes < 17 * 60
-    except Exception as exc:
-        logging.exception(f"[SESSION] Erreur filtre horaire: {exc}")
+    return True
         return False
 
 
@@ -2043,9 +2036,6 @@ def fetch_biquote_ohlcv(
     }
 
     try:
-        logging.info(
-            f"[DATA] BiQuote request | {symbol} | {timeframe} | limit={count}"
-        )
 
         response = requests.get(
             url,
@@ -2161,11 +2151,6 @@ def fetch_biquote_ohlcv(
             .reset_index(
                 drop=True
             )
-        )
-
-        logging.info(
-            f"[DATA] BiQuote OK | {symbol} | {timeframe} | candles={len(df)} | "
-            f"last={df['close'].iloc[-1]:.8f}"
         )
 
         return df
@@ -3460,22 +3445,8 @@ def scan_market_m15(
 ):
     """Analyse M15 uniquement pendant la fenêtre Londres/New York."""
     try:
-        now = datetime.now(timezone.utc)
-        if not is_trading_session(now):
-            logging.info(
-                f"[M15] {symbol} | hors session UTC 07:00-17:00 | skip"
-            )
+        if not is_trading_session() or is_pair_locked_today(symbol):
             return
-
-        if is_pair_locked_today(symbol):
-            logging.info(
-                f"[M15] {symbol} | verrouillé pour aujourd'hui | skip"
-            )
-            return
-
-        logging.info(
-            f"[M15] {symbol} | début analyse | UTC={now.strftime('%H:%M:%S')}"
-        )
         df_m15 = fetch_biquote_ohlcv(
             symbol,
             timeframe="15m",
@@ -4274,14 +4245,7 @@ def scan_pending_opportunities_m5():
         )
 
     if not opportunities:
-        logging.info(
-            "[M5] cycle | aucune opportunité M15 en attente"
-        )
         return
-
-    logging.info(
-        f"[M5] cycle | opportunités en attente={len(opportunities)}"
-    )
 
     snapshot = [
         (candidate_id, opportunity.copy())
@@ -4325,10 +4289,6 @@ def scan_all_symbols_m15():
     Une panne d'un actif n'arrête jamais les trois autres.
     """
 
-    logging.info(
-        f"[M15] cycle global | démarrage | actifs={','.join(SYMBOLS)}"
-    )
-
     with ThreadPoolExecutor(
         max_workers=SCAN_WORKERS,
         thread_name_prefix="m15-symbol"
@@ -4350,99 +4310,36 @@ def scan_all_symbols_m15():
                     f"[M15] Worker {symbol} en erreur: {e}"
                 )
 
-    logging.info("[M15] cycle global | terminé")
-
 
 # ==========================================
 # SCHEDULER MULTI-TIMEFRAME
 # ==========================================
 
-async def _run_scheduler_job(name, function):
-    try:
-        logging.info(f"[SCHEDULER] lancement job={name}")
-        await asyncio.to_thread(function)
-        logging.info(f"[SCHEDULER] fin job={name}")
-    except Exception as exc:
-        logging.exception(
-            f"[SCHEDULER] job={name} en erreur: {exc}"
-        )
-
-
 async def _async_market_scheduler():
     last_m15_slot = None
     last_m5_slot = None
-    last_heartbeat = None
-    m15_task = None
-    m5_task = None
-
-    logging.info(
-        "[SCHEDULER] boucle marché active | UTC 07:00-17:00 | "
-        f"actifs={','.join(SYMBOLS)}"
-    )
-
     while True:
         try:
             now = datetime.now(timezone.utc)
-            in_session = is_trading_session(now)
-
-            heartbeat_key = now.replace(second=0, microsecond=0)
-            if last_heartbeat != heartbeat_key:
-                logging.info(
-                    f"[SCHEDULER] heartbeat | UTC={now.strftime('%Y-%m-%d %H:%M:%S')} | "
-                    f"session={'ACTIVE' if in_session else 'FERMEE'}"
-                )
-                last_heartbeat = heartbeat_key
-
-            if in_session:
-                m15_slot = now.replace(
-                    minute=(now.minute // 15) * 15,
-                    second=0,
-                    microsecond=0
-                )
+            if is_trading_session(now):
+                m15_slot = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
                 if now.second >= 5 and m15_slot != last_m15_slot:
-                    if m15_task is None or m15_task.done():
-                        m15_task = asyncio.create_task(
-                            _run_scheduler_job(
-                                f"M15/{m15_slot.strftime('%H:%M')}",
-                                scan_all_symbols_m15
-                            )
-                        )
-                        last_m15_slot = m15_slot
-                    else:
-                        logging.warning(
-                            f"[SCHEDULER] M15 précédent encore actif | slot={m15_slot.strftime('%H:%M')}"
-                        )
-
-                m5_slot = now.replace(
-                    minute=(now.minute // 5) * 5,
-                    second=0,
-                    microsecond=0
-                )
+                    await asyncio.to_thread(scan_all_symbols_m15)
+                    last_m15_slot = m15_slot
+                m5_slot = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
                 if now.second >= 5 and m5_slot != last_m5_slot:
-                    if m5_task is None or m5_task.done():
-                        m5_task = asyncio.create_task(
-                            _run_scheduler_job(
-                                f"M5/{m5_slot.strftime('%H:%M')}",
-                                scan_pending_opportunities_m5
-                            )
-                        )
-                        last_m5_slot = m5_slot
-                    else:
-                        logging.warning(
-                            f"[SCHEDULER] M5 précédent encore actif | slot={m5_slot.strftime('%H:%M')}"
-                        )
-
+                    await asyncio.to_thread(scan_pending_opportunities_m5)
+                    last_m5_slot = m5_slot
             await asyncio.sleep(1)
-
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logging.exception(f"[SCHEDULER] Erreur boucle: {exc}")
+            logging.exception(f"[SCHEDULER] Erreur: {exc}")
             await asyncio.sleep(5)
 
 
 def main_scheduler():
-    logging.info("Scheduler asynchrone SMC démarré — session UTC 07:00-17:00.")
+    logging.info("Scheduler asynchrone SMC démarré — fonctionnement 24h/24, 7j/7.")
     try:
         asyncio.run(_async_market_scheduler())
     except Exception as exc:
