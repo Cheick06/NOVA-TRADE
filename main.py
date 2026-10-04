@@ -50,7 +50,7 @@ TRADES_FILE = "active_trades.json"
 SIGNALS_FILE = "processed_signals.json"
 TRADE_HISTORY_FILE = "trade_history.json"
 WEEKLY_REPORTS_FILE = "weekly_reports.json"
-DAILY_TRACKER_FILE = "daily_tracker.json"
+SL_GUARD_FILE = "sl_guard.json"
 
 # Opportunités M15 en attente de surveillance M5/M1
 OPPORTUNITIES_FILE = "pending_opportunities.json"
@@ -829,10 +829,9 @@ def get_watched_pairs_message():
 
     lines.extend([
         "",
-        "Contexte : H1",
-        "Opportunités : M15",
-        "Surveillance : M5",
-        "Précision : M1 si nécessaire",
+        "Cartographie macro : M15 (300 bougies)",
+        "Liquidité / Stop Hunt : M5",
+        "Déclencheur CHoCH + BOS : M1 (chaque minute)",
         "",
         "Indicateurs : EMA20/EMA50, RSI14, ATR14, ADX14",
         "Filtre : contextuel/contributif"
@@ -1091,6 +1090,7 @@ def close_trade_in_history(trade_id, result, close_price):
                 "price": float(close_price)
             })
             save_json(TRADE_HISTORY_FILE, history)
+            _register_pair_sl_result(trade.get("symbol", ""), result)
 
     except Exception as e:
         logging.error(f"Erreur clôture journal {trade_id}: {e}")
@@ -1882,46 +1882,32 @@ def is_trading_session(now=None):
     return True
 
 
-def _daily_tracker_state():
-    today = datetime.now(timezone.utc).date().isoformat()
-    with JSON_LOCK:
-        tracker = load_json(DAILY_TRACKER_FILE)
-        if not isinstance(tracker, dict) or tracker.get("date") != today:
-            tracker = {"date": today, "locked_pairs": {}}
-            save_json(DAILY_TRACKER_FILE, tracker)
-        if not isinstance(tracker.get("locked_pairs"), dict):
-            tracker["locked_pairs"] = {}
-            save_json(DAILY_TRACKER_FILE, tracker)
-        return tracker
-
-
-def is_pair_locked_today(symbol):
+def is_pair_locked_24h(symbol):
+    symbol=str(symbol).upper()
     try:
-        tracker = _daily_tracker_state()
-        return str(symbol).upper() in tracker.get("locked_pairs", {})
-    except Exception as exc:
-        logging.exception(f"[DAILY] Erreur lecture verrou {symbol}: {exc}")
-        return True
-
-
-def lock_pair_for_today(symbol, trade_id=None):
-    try:
-        today = datetime.now(timezone.utc).date().isoformat()
+        now=datetime.now(timezone.utc)
         with JSON_LOCK:
-            tracker = load_json(DAILY_TRACKER_FILE)
-            if not isinstance(tracker, dict) or tracker.get("date") != today:
-                tracker = {"date": today, "locked_pairs": {}}
-            locked = tracker.setdefault("locked_pairs", {})
-            locked[str(symbol).upper()] = {
-                "date": today,
-                "trade_id": trade_id,
-                "locked_at": strategy_timestamp(),
-            }
-            save_json(DAILY_TRACKER_FILE, tracker)
-        return True
+            state=load_json(SL_GUARD_FILE); item=state.get(symbol) if isinstance(state,dict) else None
+            if not isinstance(item,dict) or not item.get("locked_until"):return False
+            if datetime.fromisoformat(str(item["locked_until"]).replace("Z","+00:00"))>now:return True
+            state.pop(symbol,None); save_json(SL_GUARD_FILE,state); return False
     except Exception as exc:
-        logging.exception(f"[DAILY] Impossible de verrouiller {symbol}: {exc}")
-        return False
+        logging.exception(f"[SL GUARD] Erreur lecture {symbol}: {exc}"); return False
+
+
+def _register_pair_sl_result(symbol,result):
+    symbol=str(symbol).upper(); result=str(result).upper()
+    try:
+        now=datetime.now(timezone.utc)
+        with JSON_LOCK:
+            state=load_json(SL_GUARD_FILE); state=state if isinstance(state,dict) else {}; item=state.get(symbol,{})
+            if result=="SL":
+                n=int(item.get("consecutive_sl",0))+1; state[symbol]={"consecutive_sl":n,"last_result":"SL","last_sl_at":now.isoformat(),"locked_until":(now+timedelta(hours=24)).isoformat() if n>=2 else None}
+                if n>=2:logging.warning(f"[SL GUARD] {symbol}: 2 SL successifs -> blocage 24h.")
+            else:state.pop(symbol,None)
+            save_json(SL_GUARD_FILE,state)
+    except Exception as exc:logging.exception(f"[SL GUARD] Erreur mise à jour {symbol}: {exc}")
+
 
 
 def pip_size(symbol):
@@ -2012,246 +1998,143 @@ def save_json(
 
 
 # ==========================================
-# BIQUOTE — OHLC
+# MATRICE DE SECOURS MULTI-SOURCE
 # ==========================================
 
-def fetch_biquote_ohlcv(
-    symbol,
-    timeframe="15m",
-    count=100
-):
-    """
-    Récupère les bougies OHLC depuis BiQuote.
-    """
+DATA_SOURCE_LOCK = threading.RLock()
+MARKET_DATA_CACHE_LOCK = threading.RLock()
+MARKET_DATA_CACHE = {}
+TIINGO_API_TOKEN = (os.environ.get("TIINGO_API_TOKEN", "") or os.environ.get("TIINGO_TOKEN", "")).strip()
+_TIMEFRAME_SECONDS = {"1m":60,"5m":300,"15m":900}
+_YAHOO_SYMBOLS = {"BTCUSD":"BTC-USD","XAUUSD":"GC=F","EURUSD":"EURUSD=X","GBPUSD":"GBPUSD=X"}
+_TIIINGO_SYMBOLS = {"XAUUSD":"XAUUSD","EURUSD":"EURUSD","GBPUSD":"GBPUSD"}
 
-    url = (
-        f"{BIQUOTE_BASE_URL}/"
-        f"{symbol}/ohlc"
-    )
+def _empty_market_dataframe():
+    return pd.DataFrame(columns=["open","high","low","close","volume"],index=pd.DatetimeIndex([],tz="UTC",name="timestamp"))
 
-    params = {
-        "interval": timeframe,
-        "limit": count
-    }
-
+def _normalize_market_dataframe(rows):
+    if rows is None:return None
     try:
+        df=rows.copy() if isinstance(rows,pd.DataFrame) else pd.DataFrame(rows)
+        if df.empty:return None
+        df.columns=[str(c).strip().lower() for c in df.columns]
+        df=df.rename(columns={"datetime":"timestamp","date":"timestamp","time":"timestamp","open_time":"timestamp","opentime":"timestamp","adj close":"close"})
+        if "timestamp" not in df.columns:
+            if isinstance(df.index,pd.DatetimeIndex):df["timestamp"]=df.index
+            else:return None
+        if not all(c in df.columns for c in ("open","high","low","close")):return None
+        if "volume" not in df.columns:df["volume"]=0.0
+        df["timestamp"]=pd.to_datetime(df["timestamp"],errors="coerce",utc=True)
+        for c in ("open","high","low","close","volume"):df[c]=pd.to_numeric(df[c],errors="coerce")
+        df=df.replace([np.inf,-np.inf],np.nan).dropna(subset=["timestamp","open","high","low","close"]).sort_values("timestamp").drop_duplicates("timestamp",keep="last")
+        if df.empty:return None
+        valid=(df["high"]>=df[["open","close"]].max(axis=1))&(df["low"]<=df[["open","close"]].min(axis=1))&(df["high"]>=df["low"])
+        df=df.loc[valid]
+        if df.empty:return None
+        out=df.set_index("timestamp")[["open","high","low","close","volume"]].astype(float); out.index.name="timestamp"; return out
+    except Exception as exc:
+        logging.warning(f"[DATA NORMALIZE] Données corrompues: {exc}"); return None
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=15
-        )
+def _fetch_biquote_safe(symbol,timeframe,limit):
+    r=requests.get(f"{BIQUOTE_BASE_URL}/{symbol}/ohlc",params={"interval":timeframe,"limit":int(limit)},timeout=5)
+    if r.status_code!=200:raise RuntimeError(f"BiQuote HTTP {r.status_code}")
+    payload=r.json(); bars=payload.get("bars") if isinstance(payload,dict) else None
+    if not isinstance(bars,list) or not bars:raise ValueError("Réponse BiQuote sans bars")
+    rows=[{"timestamp":b.get("openTime",b.get("timestamp")),"open":b.get("open"),"high":b.get("high"),"low":b.get("low"),"close":b.get("close"),"volume":b.get("volume",0.0)} for b in bars if isinstance(b,dict)]
+    df=_normalize_market_dataframe(rows)
+    if df is None or df.empty:raise ValueError("Données BiQuote invalides")
+    return df.tail(limit)
 
-        if response.status_code != 200:
+def _fetch_kraken_safe(symbol,timeframe,limit):
+    if symbol!="BTCUSD":raise ValueError("Kraken réservé à BTCUSD")
+    r=requests.get("https://api.kraken.com/0/public/OHLC",params={"pair":"XBTUSD","interval":{"1m":1,"5m":5,"15m":15}[timeframe]},timeout=5)
+    if r.status_code!=200:raise RuntimeError(f"Kraken HTTP {r.status_code}")
+    payload=r.json()
+    if payload.get("error"):raise RuntimeError(f"Kraken API: {payload['error']}")
+    result=payload.get("result",{}); key=next((k for k in result if k!="last"),None); raw=result.get(key) if key else None
+    if not isinstance(raw,list) or not raw:raise ValueError("Réponse Kraken vide")
+    rows=[]
+    for x in raw:
+        if isinstance(x,(list,tuple)) and len(x)>=7:rows.append({"timestamp":pd.to_datetime(float(x[0]),unit="s",utc=True),"open":x[1],"high":x[2],"low":x[3],"close":x[4],"volume":x[6]})
+    df=_normalize_market_dataframe(rows)
+    if df is None or df.empty:raise ValueError("Données Kraken invalides")
+    return df.tail(limit)
 
-            logging.error(
-                f"Erreur API BiQuote "
-                f"({response.status_code}) "
-                f"pour {symbol} {timeframe}: "
-                f"{response.text}"
-            )
+def _fetch_tiingo_safe(symbol,timeframe,limit):
+    if symbol not in _TIIINGO_SYMBOLS:raise ValueError("Tiingo réservé à XAUUSD/EURUSD/GBPUSD")
+    if not TIINGO_API_TOKEN:raise RuntimeError("TIINGO_API_TOKEN non configuré")
+    start=datetime.now(timezone.utc)-timedelta(seconds=_TIMEFRAME_SECONDS[timeframe]*max(limit+30,60))
+    r=requests.get(f"https://api.tiingo.com/tiingo/fx/{_TIIINGO_SYMBOLS[symbol]}/prices",params={"startDate":start.strftime("%Y-%m-%dT%H:%M:%SZ"),"resampleFreq":{"1m":"1min","5m":"5min","15m":"15min"}[timeframe],"token":TIINGO_API_TOKEN},timeout=5)
+    if r.status_code!=200:raise RuntimeError(f"Tiingo HTTP {r.status_code}")
+    payload=r.json()
+    if not isinstance(payload,list) or not payload:raise ValueError("Réponse Tiingo vide")
+    rows=[{"timestamp":x.get("date"),"open":x.get("open"),"high":x.get("high"),"low":x.get("low"),"close":x.get("close"),"volume":x.get("volume",0.0)} for x in payload if isinstance(x,dict)]
+    df=_normalize_market_dataframe(rows)
+    if df is None or df.empty:raise ValueError("Données Tiingo invalides")
+    return df.tail(limit)
 
-            return pd.DataFrame()
+def _fetch_yahoo_safe(symbol,timeframe,limit):
+    now=datetime.now(timezone.utc); ticker=_YAHOO_SYMBOLS[symbol]; p1=int((now-timedelta(seconds=_TIMEFRAME_SECONDS[timeframe]*max(limit+30,60))).timestamp()); p2=int(now.timestamp())
+    r=requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",params={"period1":p1,"period2":p2,"interval":timeframe,"events":"history","includeAdjustedClose":"true"},timeout=5,headers={"User-Agent":"Mozilla/5.0"})
+    if r.status_code!=200:raise RuntimeError(f"Yahoo Finance HTTP {r.status_code}")
+    payload=r.json(); result=payload.get("chart",{}).get("result")
+    if not result:raise ValueError(f"Yahoo Finance réponse vide: {payload.get('chart',{}).get('error')}")
+    q=((result[0].get("indicators") or {}).get("quote") or [{}])[0]; ts=result[0].get("timestamp") or []; o=q.get("open") or []; h=q.get("high") or []; l=q.get("low") or []; c=q.get("close") or []; v=q.get("volume") or [0.0]*len(ts)
+    rows=[{"timestamp":pd.to_datetime(stamp,unit="s",utc=True),"open":o[i] if i<len(o) else None,"high":h[i] if i<len(h) else None,"low":l[i] if i<len(l) else None,"close":c[i] if i<len(c) else None,"volume":v[i] if i<len(v) else 0.0} for i,stamp in enumerate(ts)]
+    df=_normalize_market_dataframe(rows)
+    if df is None or df.empty:raise ValueError("Données Yahoo invalides")
+    return df.tail(limit)
 
-        data = response.json()
+def _cache_market_data(symbol, timeframe, df):
+    if df is None or df.empty:
+        return
+    with MARKET_DATA_CACHE_LOCK:
+        MARKET_DATA_CACHE[(str(symbol).upper(), str(timeframe).lower())] = df.copy()
 
-        bars = data.get(
-            "bars"
-        )
 
-        if not isinstance(
-            bars,
-            list
-        ):
+def _get_cached_market_data(symbol, timeframe, limit=300):
+    with MARKET_DATA_CACHE_LOCK:
+        df = MARKET_DATA_CACHE.get((str(symbol).upper(), str(timeframe).lower()))
+        if df is None:
+            return None
+        return df.tail(limit).copy()
 
-            logging.error(
-                f"Réponse BiQuote invalide pour "
-                f"{symbol} {timeframe}: "
-                f"clé 'bars' absente."
-            )
 
-            return pd.DataFrame()
+def fetch_market_data_safe(symbol,timeframe,limit=300):
+    symbol=str(symbol).upper().strip(); timeframe=str(timeframe).lower().strip(); limit=max(1,int(limit))
+    if symbol not in SYMBOLS or timeframe not in _TIMEFRAME_SECONDS:
+        logging.warning(f"[DATA] Paramètres invalides: {symbol} {timeframe}"); return None
+    loaders=[("BiQuote",lambda:_fetch_biquote_safe(symbol,timeframe,limit))]
+    loaders.append(("Kraken",lambda:_fetch_kraken_safe(symbol,timeframe,limit)) if symbol=="BTCUSD" else ("Tiingo",lambda:_fetch_tiingo_safe(symbol,timeframe,limit)))
+    loaders.append(("Yahoo Finance",lambda:_fetch_yahoo_safe(symbol,timeframe,limit)))
+    for source,loader in loaders:
+        try:
+            with DATA_SOURCE_LOCK:
+                source_call_id = f"{symbol}:{timeframe}:{source}"
+            df=loader()
+            if df is None or df.empty:raise ValueError("DataFrame vide")
+            if list(df.columns)!=["open","high","low","close","volume"] or not isinstance(df.index,pd.DatetimeIndex):raise ValueError("Format OHLCV invalide")
+            df = df.tail(limit)
+            _cache_market_data(symbol, timeframe, df)
+            logging.info(f"[DATA {source}] {symbol} {timeframe} | {len(df)} bougies"); return df
+        except Exception as exc:logging.warning(f"[DATA FALLBACK] {source_call_id} échoue pour {symbol} {timeframe}: {exc}")
+    logging.error(f"[DATA FALLBACK] Toutes les sources ont échoué pour {symbol} {timeframe}"); return None
 
-        if not bars:
-
-            logging.warning(
-                f"BiQuote ne retourne aucune bougie "
-                f"pour {symbol} {timeframe}."
-            )
-
-            return pd.DataFrame()
-
-        df = pd.DataFrame(
-            bars
-        )
-
-        if "openTime" in df.columns:
-
-            df["timestamp"] = df[
-                "openTime"
-            ]
-
-        required_columns = [
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close"
-        ]
-
-        missing = [
-            column
-            for column in required_columns
-            if column not in df.columns
-        ]
-
-        if missing:
-
-            logging.error(
-                f"Colonnes manquantes dans "
-                f"BiQuote {symbol} {timeframe}: "
-                f"{missing}"
-            )
-
-            return pd.DataFrame()
-
-        for column in [
-            "open",
-            "high",
-            "low",
-            "close"
-        ]:
-
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce"
-            )
-
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"],
-            errors="coerce",
-            utc=True
-        )
-
-        df = df.dropna(
-            subset=[
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close"
-            ]
-        )
-
-        df = (
-            df.sort_values(
-                "timestamp"
-            )
-            .reset_index(
-                drop=True
-            )
-        )
-
-        return df
-
-    except requests.RequestException as e:
-
-        logging.error(
-            f"Impossible de joindre "
-            f"l'API BiQuote : {e}"
-        )
-
-    except ValueError as e:
-
-        logging.error(
-            f"Réponse JSON BiQuote invalide : {e}"
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"Erreur récupération OHLC BiQuote : {e}"
-        )
-
-    return pd.DataFrame()
+def fetch_biquote_ohlcv(symbol,timeframe="15m",count=100):
+    df=fetch_market_data_safe(symbol,timeframe,limit=count); return df if df is not None else _empty_market_dataframe()
 
 
 # ==========================================
-# BIQUOTE — PRIX LIVE
+# PRIX LIVE — MATRICE DE SECOURS
 # ==========================================
 
-def fetch_biquote_live_price(
-    symbol
-):
-    """
-    Récupère le prix mid actuel.
-    """
-
-    url = (
-        f"{BIQUOTE_BASE_URL}/"
-        f"{symbol}"
-    )
-
+def fetch_biquote_live_price(symbol):
     try:
-
-        response = requests.get(
-            url,
-            timeout=10
-        )
-
-        if response.status_code != 200:
-
-            logging.error(
-                f"Erreur prix BiQuote HTTP "
-                f"{response.status_code} "
-                f"pour {symbol}: "
-                f"{response.text}"
-            )
-
-            return None
-
-        data = response.json()
-
-        mid = data.get(
-            "mid"
-        )
-
-        if mid is None:
-
-            logging.error(
-                f"BiQuote ne retourne pas "
-                f"de 'mid' pour {symbol}."
-            )
-
-            return None
-
-        return float(mid)
-
-    except requests.RequestException as e:
-
-        logging.error(
-            f"Erreur connexion prix live "
-            f"BiQuote {symbol} : {e}"
-        )
-
-    except (
-        ValueError,
-        TypeError
-    ) as e:
-
-        logging.error(
-            f"Prix BiQuote invalide "
-            f"pour {symbol}: {e}"
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"Erreur prix live BiQuote "
-            f"{symbol}: {e}"
-        )
-
-    return None
+        df=fetch_market_data_safe(symbol,"1m",limit=2)
+        return float(df["close"].iloc[-1]) if df is not None and not df.empty else None
+    except Exception as exc:
+        logging.warning(f"[LIVE PRICE] Erreur {symbol}: {exc}")
+        return None
 
 
 # ==========================================
@@ -2908,7 +2791,7 @@ def detect_structure_pivots(
                 "type": "HIGH",
                 "index": i,
                 "price": float(high_value),
-                "timestamp": str(df["timestamp"].iloc[i])
+                "timestamp": str(df.index[i])
             })
 
         if low_value == low_window.min():
@@ -2916,7 +2799,7 @@ def detect_structure_pivots(
                 "type": "LOW",
                 "index": i,
                 "price": float(low_value),
-                "timestamp": str(df["timestamp"].iloc[i])
+                "timestamp": str(df.index[i])
             })
 
     return sorted(pivots, key=lambda item: item["index"])
@@ -3063,75 +2946,40 @@ def _cluster_m15_pivots(levels, types, atr_value, symbol):
     return clusters
 
 
-def build_m15_major_zones(df, symbol, window=5):
-    symbol = str(symbol).upper()
-    if symbol not in M15_ZONE_BUFFER_PCT:
-        raise ValueError(f"Symbole non supporté: {symbol}")
+def _detect_m15_order_blocks(df,lookback=120):
+    data=df.tail(lookback); bull=[]; bear=[]; atr=_m15_zone_atr(data,14).replace(0,np.nan); body=(data["close"]-data["open"]).abs(); disp=body>=(atr*0.8)
+    for i in range(1,len(data)-1):
+        if not bool(disp.iloc[i+1]):continue
+        p,m=data.iloc[i],data.iloc[i+1]
+        if float(m["close"])>float(m["open"]) and float(p["close"])<float(p["open"]):bull.append({"type":"BULLISH_OB","index":i,"timestamp":str(data.index[i]),"low":float(p["low"]),"high":float(p["high"])})
+        elif float(m["close"])<float(m["open"]) and float(p["close"])>float(p["open"]):bear.append({"type":"BEARISH_OB","index":i,"timestamp":str(data.index[i]),"low":float(p["low"]),"high":float(p["high"])})
+    return bull[-12:],bear[-12:]
 
-    if df is None or df.empty:
-        return {"zones": [], "bias": None, "bos": None, "bos_level": None}
+def _detect_m15_fvgs(df,lookback=150):
+    data=df.tail(lookback); bull=[];bear=[]
+    for i in range(2,len(data)):
+        a,c=data.iloc[i-2],data.iloc[i]
+        if float(c["low"])>float(a["high"]):bull.append({"type":"BULLISH_FVG","index":i,"timestamp":str(data.index[i]),"lower":float(a["high"]),"upper":float(c["low"])})
+        if float(c["high"])<float(a["low"]):bear.append({"type":"BEARISH_FVG","index":i,"timestamp":str(data.index[i]),"lower":float(c["high"]),"upper":float(a["low"])})
+    return bull[-20:],bear[-20:]
 
-    data = df.copy()
-    data.columns = [str(c).strip().lower() for c in data.columns]
-    for col in ("open", "high", "low", "close"):
-        data[col] = pd.to_numeric(data[col], errors="coerce")
-    data = data.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-
-    if len(data) < 2 * window + 1:
-        return {"zones": [], "bias": None, "bos": None, "bos_level": None}
-
-    atr_value = float(_m15_zone_atr(data, M15_ZONE_ATR_PERIOD).iloc[-1])
-    pivots = detect_pivots(data, window=window)
-
-    high_levels = pivots["highs"]["price"].tolist()
-    low_levels = pivots["lows"]["price"].tolist()
-    levels = high_levels + low_levels
-    types = (["RESISTANCE"] * len(high_levels)
-             + ["SUPPORT"] * len(low_levels))
-
-    zones = []
-    for level, level_type in _cluster_m15_pivots(levels, types, atr_value, symbol):
-        width = _m15_zone_width(level, atr_value, symbol)
-        touches = _m15_zone_touch_count(data, level, width, level_type)
-        if touches >= M15_ZONE_MIN_TOUCHES:
-            zones.append({
-                "level_type": level_type,
-                "zone_min": float(level - width),
-                "zone_max": float(level + width),
-                "touches": touches,
-                "is_active": True
-            })
-
-    # Biais global M15 : EMA20/EMA50 sur la dernière bougie clôturée.
-    closed = data.iloc[:-1] if len(data) > 1 else data
-    close_series = closed["close"]
-    ema20 = close_series.ewm(span=20, adjust=False, min_periods=1).mean().iloc[-1]
-    ema50 = close_series.ewm(span=50, adjust=False, min_periods=1).mean().iloc[-1]
-    bias = "BULLISH" if ema20 > ema50 else "BEARISH" if ema20 < ema50 else None
-
-    bos = None
-    bos_level = None
-    last_closed = data.iloc[-2] if len(data) > 1 else data.iloc[-1]
-
-    for idx, zone in enumerate(zones):
-        if zone["level_type"] == "RESISTANCE" and float(last_closed["close"]) > zone["zone_max"] and float(last_closed["close"]) >= float(last_closed["open"]):
-            zone["is_active"] = False
-            if bos is None or zone["zone_max"] > bos_level:
-                bos = "BULLISH_BOS"
-                bos_level = float(zone["zone_max"])
-        elif zone["level_type"] == "SUPPORT" and float(last_closed["close"]) < zone["zone_min"] and float(last_closed["close"]) <= float(last_closed["open"]):
-            zone["is_active"] = False
-            if bos is None or bos_level is None or zone["zone_min"] < bos_level:
-                bos = "BEARISH_BOS"
-                bos_level = float(zone["zone_min"])
-
-    return {
-        "zones": zones,
-        "bias": bias,
-        "bos": bos,
-        "bos_level": bos_level
-    }
-
+def build_m15_major_zones(df,symbol,window=5):
+    symbol=str(symbol).upper()
+    if symbol not in M15_ZONE_BUFFER_PCT:raise ValueError(f"Symbole non supporté: {symbol}")
+    if df is None or df.empty:return {"zones":[],"bias":None,"bos":None,"bos_level":None,"order_blocks":[],"fvgs":[],"macro_high":None,"macro_low":None}
+    data=df.copy();data.columns=[str(c).strip().lower() for c in data.columns]
+    for col in ("open","high","low","close"):data[col]=pd.to_numeric(data[col],errors="coerce")
+    data=data.dropna(subset=["open","high","low","close"])
+    atr=float(_m15_zone_atr(data,M15_ZONE_ATR_PERIOD).iloc[-1]);piv=detect_pivots(data,window);hi=piv["highs"]["price"].tolist();lo=piv["lows"]["price"].tolist();levels=hi+lo;types=["RESISTANCE"]*len(hi)+["SUPPORT"]*len(lo);zones=[]
+    for level,typ in _cluster_m15_pivots(levels,types,atr,symbol):
+        w=_m15_zone_width(level,atr,symbol);touch=_m15_zone_touch_count(data,level,w,typ)
+        if touch>=M15_ZONE_MIN_TOUCHES:zones.append({"level_type":typ,"zone_min":float(level-w),"zone_max":float(level+w),"touches":touch,"is_active":True})
+    closed=data.iloc[:-1] if len(data)>1 else data;ema20=closed["close"].ewm(span=20,adjust=False).mean().iloc[-1];ema50=closed["close"].ewm(span=50,adjust=False).mean().iloc[-1];bias="BULLISH" if ema20>ema50 else "BEARISH" if ema20<ema50 else None;bos=None;bos_level=None;last=data.iloc[-2]
+    for z in zones:
+        if z["level_type"]=="RESISTANCE" and float(last["close"])>z["zone_max"] and float(last["close"])>=float(last["open"]):z["is_active"]=False;bos,bos_level=("BULLISH_BOS",float(z["zone_max"])) if bos is None or z["zone_max"]>bos_level else (bos,bos_level)
+        elif z["level_type"]=="SUPPORT" and float(last["close"])<z["zone_min"] and float(last["close"])<=float(last["open"]):z["is_active"]=False;bos,bos_level=("BEARISH_BOS",float(z["zone_min"])) if bos is None or bos_level is None or z["zone_min"]<bos_level else (bos,bos_level)
+    ob1,ob2=_detect_m15_order_blocks(data);fv1,fv2=_detect_m15_fvgs(data)
+    return {"zones":zones,"bias":bias,"bos":bos,"bos_level":bos_level,"order_blocks":ob1+ob2,"fvgs":fv1+fv2,"macro_high":float(data["high"].max()),"macro_low":float(data["low"].min())}
 
 def update_m15_major_zones(df, symbol, window=5):
     state = build_m15_major_zones(df, symbol, window)
@@ -3142,6 +2990,10 @@ def update_m15_major_zones(df, symbol, window=5):
             "bias": state["bias"],
             "bos": state["bos"],
             "bos_level": state["bos_level"],
+            "order_blocks": [dict(x) for x in state.get("order_blocks",[])],
+            "fvgs": [dict(x) for x in state.get("fvgs",[])],
+            "macro_high": state.get("macro_high"),
+            "macro_low": state.get("macro_low"),
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
     return state
@@ -3178,6 +3030,8 @@ def check_m15_zones(current_price, symbol):
             "bos_timestamp": strategy_timestamp(),
             "trigger_price": trigger,
             "trigger_type": zone["level_type"],
+            "zone_min": float(zone["zone_min"]),
+            "zone_max": float(zone["zone_max"]),
             "trigger_timestamp": strategy_timestamp(),
             "closed_timestamp": strategy_timestamp()
         }
@@ -3282,7 +3136,7 @@ def check_m15_structure(
             "trigger_type": "SUPPORT",
             "trigger_timestamp": macro_low["timestamp"],
             "closed_timestamp": str(
-                closed_candle["timestamp"]
+                closed_candle.name
             )
         }
 
@@ -3304,7 +3158,7 @@ def check_m15_structure(
             "trigger_type": "RESISTANCE",
             "trigger_timestamp": macro_high["timestamp"],
             "closed_timestamp": str(
-                closed_candle["timestamp"]
+                closed_candle.name
             )
         }
 
@@ -3391,6 +3245,8 @@ def create_pending_opportunity(
             m15_structure["bos_timestamp"]
         ),
         "trigger_type": m15_structure["trigger_type"],
+        "m15_zone_min": float(m15_structure.get("zone_min",m15_structure["trigger_price"])),
+        "m15_zone_max": float(m15_structure.get("zone_max",m15_structure["trigger_price"])),
         "trigger_timestamp": str(
             m15_structure["trigger_timestamp"]
         ),
@@ -3442,17 +3298,17 @@ def create_pending_opportunity(
 def scan_market_m15(
     symbol
 ):
-    """Analyse M15 uniquement pendant la fenêtre Londres/New York."""
+    """Cartographie macro M15 sur 300 bougies: OB, FVG et S/R."""
     try:
-        if not is_trading_session() or is_pair_locked_today(symbol):
+        if not is_trading_session() or is_pair_locked_24h(symbol):
             return
         df_m15 = fetch_biquote_ohlcv(
             symbol,
             timeframe="15m",
-            count=200
+            count=300
         )
 
-        if df_m15.empty or len(df_m15) < 30:
+        if df_m15.empty or len(df_m15) < 300:
             logging.warning(
                 f"[M15 ZONES] Données insuffisantes pour {symbol}."
             )
@@ -3464,17 +3320,14 @@ def scan_market_m15(
             window=5
         )
 
-        current_price = float(df_m15["close"].iloc[-1])
+        current_price = float(df_m15["close"].iloc[-2])
         opportunity = check_m15_zones(
             current_price,
             symbol
         )
 
         logging.info(
-            f"[M15 ZONES] {symbol} | zones={len(state['zones'])} | "
-            f"actives={sum(1 for z in state['zones'] if z['is_active'])} | "
-            f"bias={state['bias']} | BOS={state['bos']} | "
-            f"price={current_price:.8f}"
+            f"[M15 MACRO] {symbol} | 300 bougies | SR={len(state['zones'])} | OB={len(state.get('order_blocks',[]))} | FVG={len(state.get('fvgs',[]))} | bias={state['bias']} | BOS={state['bos']} | price={current_price:.8f}"
         )
 
         if opportunity:
@@ -3495,7 +3348,7 @@ def _last_closed_timestamp(
         return None
 
     return str(
-        df["timestamp"].iloc[-2]
+        df.index[-2]
     )
 
 
@@ -3512,7 +3365,7 @@ def _get_newest_closed_candle(
         return closed_df.iloc[-1]
 
     matches = closed_df[
-        closed_df["timestamp"].astype(str)
+        closed_df.index.astype(str)
         != str(last_timestamp)
     ]
 
@@ -3522,56 +3375,12 @@ def _get_newest_closed_candle(
     return matches.iloc[-1]
 
 
-def check_m5_liquidity(
-    df,
-    opp
-):
-    """
-    Validation du Stop Hunt M5 sur la bougie M5 clôturée.
-
-    HAUSSIER :
-        low < trigger puis close > trigger.
-
-    BAISSIER :
-        high > trigger puis close < trigger.
-    """
-
-    if df is None or len(df) < 5:
-        return False, None
-
-    trigger = float(
-        opp["trigger_price"]
-    )
-    direction = opp["direction"]
-
-    last_closed = df.iloc[-2]
-
-    candle_timestamp = str(
-        last_closed["timestamp"]
-    )
-
-    if (
-        opp.get("last_processed_m5_timestamp")
-        == candle_timestamp
-    ):
-        return False, None
-
-    high = float(last_closed["high"])
-    low = float(last_closed["low"])
-    close = float(last_closed["close"])
-
-    if direction == "HAUSSIER":
-        confirmed = (
-            low < trigger
-            and close > trigger
-        )
-    else:
-        confirmed = (
-            high > trigger
-            and close < trigger
-        )
-
-    return confirmed, candle_timestamp
+def check_m5_liquidity(df,opp):
+    if df is None or len(df)<5:return False,None
+    direction=str(opp["direction"]).upper();stamp=str(df.index[-2]);last=df.iloc[-2]
+    if opp.get("last_processed_m5_timestamp")==stamp:return False,None
+    zmin=float(opp.get("m15_zone_min",opp["trigger_price"]));zmax=float(opp.get("m15_zone_max",opp["trigger_price"]));high=float(last["high"]);low=float(last["low"]);close=float(last["close"])
+    return ((low<zmin and zmin<=close<=zmax) if direction=="HAUSSIER" else (high>zmax and zmin<=close<=zmax)),stamp
 
 
 def _find_last_opposite_pivot(
@@ -3626,7 +3435,7 @@ def check_m1_choch(df, opp):
 
         start_idx = 0
         if m5_timestamp:
-            ts = df["timestamp"].astype(str)
+            ts = df.index.astype(str)
             matches = [i for i, value in enumerate(ts) if value >= str(m5_timestamp)]
             if matches:
                 start_idx = matches[0]
@@ -3636,12 +3445,18 @@ def check_m1_choch(df, opp):
         segment = df.iloc[start_idx:end_idx + 1]
         if segment.empty:
             return None
-        structural_sl = float(segment["low"].min()) if direction == "HAUSSIER" else float(segment["high"].max())
+        if direction == "HAUSSIER":
+            manipulation_index = segment["low"].idxmin()
+            structural_sl = float(segment.loc[manipulation_index, "low"])
+        else:
+            manipulation_index = segment["high"].idxmax()
+            structural_sl = float(segment.loc[manipulation_index, "high"])
+        manipulation_timestamp = str(manipulation_index)
         return {
-            "timestamp": str(candle["timestamp"]),
+            "timestamp": str(candle.name),
             "broken_level": float(broken["price"]),
             "sl": structural_sl,
-            "sl_timestamp": str(candle["timestamp"]),
+            "sl_timestamp": manipulation_timestamp,
             "pivot_index": int(broken["index"]),
             "m5_liquidity_index": int(start_idx),
             "m1_choch_index": int(end_idx),
@@ -3678,7 +3493,7 @@ def _find_order_block(
                 return {
                     "index": int(i),
                     "timestamp": str(
-                        candle["timestamp"]
+                        candle.name
                     ),
                     "open": open_price,
                     "high": float(candle["high"]),
@@ -3692,7 +3507,7 @@ def _find_order_block(
                 return {
                     "index": int(i),
                     "timestamp": str(
-                        candle["timestamp"]
+                        candle.name
                     ),
                     "open": open_price,
                     "high": float(candle["high"]),
@@ -3712,9 +3527,9 @@ def _find_recent_fvg(df, bos_index, direction, lookback=4):
             a = df.iloc[i - 2]
             c = df.iloc[i]
             if direction == "HAUSSIER" and float(c["low"]) > float(a["high"]):
-                return {"index": i, "type": "FVG_HAUSSIER", "lower": float(a["high"]), "upper": float(c["low"]), "entry": float(c["low"]), "timestamp": str(c["timestamp"])}
+                return {"index": i, "type": "FVG_HAUSSIER", "lower": float(a["high"]), "upper": float(c["low"]), "entry": float(c["low"]), "timestamp": str(c.name)}
             if direction == "BAISSIER" and float(c["high"]) < float(a["low"]):
-                return {"index": i, "type": "FVG_BAISSIER", "lower": float(c["high"]), "upper": float(a["low"]), "entry": float(c["high"]), "timestamp": str(c["timestamp"])}
+                return {"index": i, "type": "FVG_BAISSIER", "lower": float(c["high"]), "upper": float(a["low"]), "entry": float(c["high"]), "timestamp": str(c.name)}
     except Exception as exc:
         logging.exception(f"[FVG] Erreur détection: {exc}")
     return None
@@ -3729,7 +3544,7 @@ def check_m1_bos(df, opp):
             return None
         choch_timestamp = str(opp.get("m1_choch_timestamp"))
         closed_df = df.iloc[:-1].copy()
-        positions = [i for i, value in enumerate(closed_df["timestamp"].astype(str)) if value == choch_timestamp]
+        positions = [i for i, value in enumerate(closed_df.index.astype(str)) if value == choch_timestamp]
         if not positions:
             return None
         choch_index = positions[-1]
@@ -3758,7 +3573,7 @@ def check_m1_bos(df, opp):
         if (direction == "HAUSSIER" and sl >= entry) or (direction == "BAISSIER" and sl <= entry):
             return None
         return {
-            "timestamp": str(df["timestamp"].iloc[closed_index]),
+            "timestamp": str(df.index[closed_index]),
             "bos_level": float(target["price"]),
             "bos_pivot_timestamp": str(target["timestamp"]),
             "order_block": order_block,
@@ -3772,41 +3587,38 @@ def check_m1_bos(df, opp):
         return None
 
 
-def calculate_take_profits(direction, entry_price, stop_loss, df_m15):
+def _last_m5_structural_target(df_m5, direction, minimum_target):
+    pivots=detect_structure_pivots(df_m5,M5_PIVOT_LEFT,M5_PIVOT_RIGHT)
+    if str(direction).upper()=="HAUSSIER":
+        c=[p for p in pivots if p["type"]=="HIGH" and p["price"]>minimum_target]
+        fallback=float(df_m5["high"].max())
+        return float(c[-1]["price"] if c else fallback)
+    c=[p for p in pivots if p["type"]=="LOW" and p["price"]<minimum_target]
+    fallback=float(df_m5["low"].min())
+    return float(c[-1]["price"] if c else fallback)
+
+
+def calculate_take_profits(direction,entry_price,stop_loss,df_m5,df_m15):
     try:
-        direction = str(direction).strip().upper()
-        entry_price = float(entry_price); stop_loss = float(stop_loss)
-        if direction not in ("HAUSSIER", "BAISSIER") or df_m15 is None or df_m15.empty:
-            return None
-        recent = df_m15.tail(12).copy()
-        if len(recent) < 12:
-            return None
-        highs = pd.to_numeric(recent["high"], errors="coerce").dropna()
-        lows = pd.to_numeric(recent["low"], errors="coerce").dropna()
-        if direction == "HAUSSIER":
-            if stop_loss >= entry_price: return None
-            risk = entry_price - stop_loss
-            tp1 = entry_price + risk
-            tp3 = float(highs.max()) * 0.9998
-            reward = tp3 - entry_price
+        direction=str(direction).upper();entry_price=float(entry_price);stop_loss=float(stop_loss)
+        if direction not in ("HAUSSIER","BAISSIER") or df_m5 is None or df_m15 is None or len(df_m5)<10 or len(df_m15)<50:return None
+        if direction=="HAUSSIER":
+            if stop_loss>=entry_price:return None
+            risk=entry_price-stop_loss;tp1=entry_price+risk;tp2=_last_m5_structural_target(df_m5,direction,tp1);tp3=float(df_m15["high"].max())*0.9998
+            if tp2<=entry_price:tp2=tp1
+            if tp3<=tp2:return None
+            reward=tp3-entry_price
         else:
-            if stop_loss <= entry_price: return None
-            risk = stop_loss - entry_price
-            tp1 = entry_price - risk
-            tp3 = float(lows.min()) * 1.0002
-            reward = entry_price - tp3
-        if risk <= 0 or reward <= 0:
-            return None
-        rr = reward / risk
-        if rr < 3.0:
-            return None
-        tp2 = (tp1 + tp3) / 2.0
-        if not all(math.isfinite(x) for x in (tp1,tp2,tp3,rr)):
-            return None
-        return {"tp1": float(tp1), "tp2": float(tp2), "tp3": float(tp3), "rr_tp3": float(rr), "swing_lookback": 12}
-    except Exception as exc:
-        logging.exception(f"[TP] Erreur calcul TP: {exc}")
-        return None
+            if stop_loss<=entry_price:return None
+            risk=stop_loss-entry_price;tp1=entry_price-risk;tp2=_last_m5_structural_target(df_m5,direction,tp1);tp3=float(df_m15["low"].min())*1.0002
+            if tp2>=entry_price:tp2=tp1
+            if tp3>=tp2:return None
+            reward=entry_price-tp3
+        if risk<=0 or reward<=0:return None
+        rr=reward/risk
+        if rr<3.0:return None
+        return {"tp1":float(tp1),"tp2":float(tp2),"tp3":float(tp3),"rr_tp3":float(rr),"tp2_source":"M5_STRUCTURAL_PIVOT","tp3_source":"M15_300_MACRO_EXTREME"}
+    except Exception as exc:logging.exception(f"[TP] Erreur calcul TP: {exc}");return None
 
 
 def _build_active_trade(
@@ -3820,13 +3632,9 @@ def _build_active_trade(
     entry = float(execution["entry_price"])
     sl = float(execution["sl"])
 
-    df_m15 = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="15m",
-        count=200
-    )
-
-    if df_m15.empty or len(df_m15) < 30:
+    df_m15=fetch_biquote_ohlcv(symbol,timeframe="15m",count=300)
+    df_m5=fetch_biquote_ohlcv(symbol,timeframe="5m",count=300)
+    if df_m15.empty or len(df_m15)<50 or df_m5.empty or len(df_m5)<10:
         logging.info(
             f"[M1] {symbol} {direction}: données M15 insuffisantes pour TP."
         )
@@ -3836,6 +3644,7 @@ def _build_active_trade(
         direction=direction,
         entry_price=entry,
         stop_loss=sl,
+        df_m5=df_m5,
         df_m15=df_m15
     )
     if tp_levels is None:
@@ -3889,7 +3698,7 @@ def _build_active_trade(
 def execute_m1_order(candidate_id, opp, execution):
     try:
         symbol = str(opp.get("symbol", "")).upper()
-        if symbol not in SYMBOLS or not is_trading_session() or is_pair_locked_today(symbol):
+        if symbol not in SYMBOLS or not is_trading_session() or is_pair_locked_24h(symbol):
             return False
         result = _build_active_trade(candidate_id, opp, execution)
         if result is None:
@@ -3916,11 +3725,8 @@ def execute_m1_order(candidate_id, opp, execution):
         if not send_telegram_message(message):
             logging.error(f"[EXECUTION] {trade_id}: Telegram non confirmé; paire non verrouillée.")
             return False
-        if not lock_pair_for_today(symbol, trade_id):
-            logging.error(f"[DAILY] {symbol}: trade envoyé mais verrou quotidien non confirmé.")
-            return True
         _delete_opportunity(candidate_id)
-        logging.info(f"[EXECUTION] {trade_id} envoyé et {symbol} verrouillé pour la journée.")
+        logging.info(f"[EXECUTION] {trade_id} envoyé pour {symbol}.")
         return True
     except Exception as exc:
         logging.exception(f"[EXECUTION] Erreur {candidate_id}: {exc}")
@@ -4027,16 +3833,19 @@ def _process_pending_opportunity(
     status = opportunity.get("status")
 
     try:
-        if not is_trading_session() or is_pair_locked_today(symbol):
+        if not is_trading_session() or is_pair_locked_24h(symbol):
             return
         if status == "WAITING_M5_LIQUIDITY":
             df_m5 = fetch_biquote_ohlcv(
                 symbol,
                 timeframe="5m",
-                count=100
+                count=300
             )
 
             if df_m5.empty:
+                return
+            latest_m5_closed=str(df_m5.index[-2]) if len(df_m5)>=2 else None
+            if latest_m5_closed==opportunity.get("last_processed_m5_timestamp"):
                 return
 
             if _stage_age_expired(
@@ -4089,11 +3898,9 @@ def _process_pending_opportunity(
             status = "WAITING_M1_CHOCH"
 
         if status == "WAITING_M1_CHOCH":
-            df_m1 = fetch_biquote_ohlcv(
-                symbol,
-                timeframe="1m",
-                count=150
-            )
+            df_m1 = _get_cached_market_data(symbol, "1m", 300)
+            if df_m1 is None or df_m1.empty:
+                df_m1 = fetch_biquote_ohlcv(symbol, timeframe="1m", count=300)
 
             if df_m1.empty:
                 return
@@ -4157,11 +3964,9 @@ def _process_pending_opportunity(
             status = "WAITING_M1_BOS"
 
         if status == "WAITING_M1_BOS":
-            df_m1 = fetch_biquote_ohlcv(
-                symbol,
-                timeframe="1m",
-                count=200
-            )
+            df_m1 = _get_cached_market_data(symbol, "1m", 300)
+            if df_m1 is None or df_m1.empty:
+                df_m1 = fetch_biquote_ohlcv(symbol, timeframe="1m", count=300)
 
             if df_m1.empty:
                 return
@@ -4233,54 +4038,43 @@ def _process_pending_opportunity(
         )
 
 
-def scan_pending_opportunities_m5():
-    """
-    Traite chaque opportunité indépendamment.
-    """
+def scan_all_symbols_m1():
+    """Scan M1 global de tous les actifs chaque minute, puis déclenche les étapes M5/M1 des opportunités."""
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix="m1-market") as executor:
+        futures={
+            executor.submit(fetch_biquote_ohlcv,symbol,"1m",300): symbol
+            for symbol in SYMBOLS
+            if not is_pair_locked_24h(symbol)
+        }
+        for future in as_completed(futures):
+            symbol=futures[future]
+            try:
+                df=future.result()
+                if df is not None and not df.empty:
+                    logging.info(f"[M1 SCAN] {symbol} | 300 bougies | close={float(df['close'].iloc[-2]):.8f}")
+            except Exception as exc:
+                logging.exception(f"[M1 SCAN] {symbol} erreur: {exc}")
 
     with JSON_LOCK:
-        opportunities = load_json(
-            OPPORTUNITIES_FILE
-        )
-
+        opportunities=load_json(OPPORTUNITIES_FILE)
     if not opportunities:
         return
-
-    snapshot = [
-        (candidate_id, opportunity.copy())
-        for candidate_id, opportunity
-        in opportunities.items()
-    ]
-
-    workers = max(
-        1,
-        min(
-            SCAN_WORKERS,
-            len(snapshot)
-        )
-    )
-
-    with ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="smc-pending"
-    ) as executor:
-        futures = [
-            executor.submit(
-                _process_pending_opportunity,
-                candidate_id,
-                opportunity
-            )
-            for candidate_id, opportunity in snapshot
-        ]
-
+    snapshot=[(candidate_id,opportunity.copy()) for candidate_id,opportunity in opportunities.items()]
+    workers=max(1,min(SCAN_WORKERS,len(snapshot)))
+    with ThreadPoolExecutor(max_workers=workers,thread_name_prefix="smc-pending") as executor:
+        futures=[executor.submit(_process_pending_opportunity,candidate_id,opportunity) for candidate_id,opportunity in snapshot]
         for future in as_completed(futures):
             try:
                 future.result()
-            except Exception as e:
-                logging.exception(
-                    f"[SMC] Erreur worker pending: {e}"
-                )
+            except Exception as exc:
+                logging.exception(f"[SMC] Erreur worker pending: {exc}")
 
+
+def scan_pending_opportunities_m1():
+    return scan_all_symbols_m1()
+
+def scan_pending_opportunities_m5():
+    return scan_pending_opportunities_m1()
 
 def scan_all_symbols_m15():
     """
@@ -4315,34 +4109,25 @@ def scan_all_symbols_m15():
 # ==========================================
 
 async def _async_market_scheduler():
-    last_m15_slot = None
-    last_m5_slot = None
+    last_m15_slot=None;last_m1_slot=None
     while True:
         try:
-            now = datetime.now(timezone.utc)
+            now=datetime.now(timezone.utc)
             if is_trading_session(now):
-                m15_slot = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
-                if now.second >= 5 and m15_slot != last_m15_slot:
-                    await asyncio.to_thread(scan_all_symbols_m15)
-                    last_m15_slot = m15_slot
-                m5_slot = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
-                if now.second >= 5 and m5_slot != last_m5_slot:
-                    await asyncio.to_thread(scan_pending_opportunities_m5)
-                    last_m5_slot = m5_slot
+                m15_slot=now.replace(minute=(now.minute//15)*15,second=0,microsecond=0)
+                if now.second>=5 and m15_slot!=last_m15_slot:
+                    await asyncio.to_thread(scan_all_symbols_m15);last_m15_slot=m15_slot
+                m1_slot=now.replace(second=0,microsecond=0)
+                if now.second>=5 and m1_slot!=last_m1_slot:
+                    await asyncio.to_thread(scan_all_symbols_m1);last_m1_slot=m1_slot
             await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logging.exception(f"[SCHEDULER] Erreur: {exc}")
-            await asyncio.sleep(5)
-
+        except asyncio.CancelledError:raise
+        except Exception as exc:logging.exception(f"[SCHEDULER] Erreur: {exc}");await asyncio.sleep(5)
 
 def main_scheduler():
-    logging.info("Scheduler asynchrone SMC démarré — fonctionnement 24h/24, 7j/7.")
-    try:
-        asyncio.run(_async_market_scheduler())
-    except Exception as exc:
-        logging.exception(f"[SCHEDULER] Arrêt inattendu: {exc}")
+    logging.info("Scheduler asynchrone SMC démarré — M15 macro / M5 liquidité / M1 déclencheur, 24h/24, 7j/7.")
+    try:asyncio.run(_async_market_scheduler())
+    except Exception as exc:logging.exception(f"[SCHEDULER] Arrêt inattendu: {exc}")
 
 
 # ==========================================
