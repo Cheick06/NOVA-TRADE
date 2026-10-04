@@ -20,10 +20,75 @@ LABELS={'WAITING_M5_LIQUIDITY':'Attente Liquidité M5','WAITING_M1_CHOCH':'Atten
 BASE_HTML = """<!doctype html>
 <html lang="fr" class="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title or 'NOVA' }}</title><script src="https://cdn.tailwindcss.com"></script><script>tailwind.config={darkMode:'class'}</script></head>
 <body class="bg-slate-950 text-slate-100 min-h-screen"><div class="max-w-7xl mx-auto p-4 md:p-6">{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="mb-3 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm">{{ message }}</div>{% endfor %}{% endwith %}{{ body|safe }}</div></body></html>"""
+NAV_HTML = """
+<nav class="sticky top-3 z-30 mb-6 rounded-2xl border border-slate-800/90 bg-slate-900/90 backdrop-blur p-2 shadow-xl">
+  <div class="flex items-center justify-between gap-2">
+    <a href="/" class="px-3 py-2 font-black tracking-[.18em] text-cyan-400">NOVA</a>
+    <div class="hidden md:flex flex-wrap gap-1 text-sm">
+      <a href="/" class="rounded-xl px-3 py-2 hover:bg-slate-800">Dashboard</a>
+      <a href="/history" class="rounded-xl px-3 py-2 hover:bg-slate-800">Historique</a>
+      <a href="/strategy" class="rounded-xl px-3 py-2 hover:bg-slate-800">Stratégie</a>
+      <a href="/founder" class="rounded-xl px-3 py-2 hover:bg-slate-800">Fondateur</a>
+      <a href="/roadmap" class="rounded-xl px-3 py-2 hover:bg-slate-800">Évolution</a>
+      <a href="/faq" class="rounded-xl px-3 py-2 hover:bg-slate-800">FAQ</a>
+    </div>
+    <button onclick="document.getElementById('mobileNav').classList.toggle('hidden')" class="md:hidden rounded-xl border border-slate-700 px-3 py-2">☰</button>
+  </div>
+  <div id="mobileNav" class="hidden md:hidden grid grid-cols-2 gap-2 pt-2 text-sm">
+    <a href="/" class="rounded-xl bg-slate-950 px-3 py-2">Dashboard</a>
+    <a href="/history" class="rounded-xl bg-slate-950 px-3 py-2">Historique</a>
+    <a href="/strategy" class="rounded-xl bg-slate-950 px-3 py-2">Stratégie</a>
+    <a href="/founder" class="rounded-xl bg-slate-950 px-3 py-2">Fondateur</a>
+    <a href="/roadmap" class="rounded-xl bg-slate-950 px-3 py-2">Évolution</a>
+    <a href="/faq" class="rounded-xl bg-slate-950 px-3 py-2">FAQ</a>
+  </div>
+</nav>
+"""
+PUBLIC_HTML = """{% extends_base %}{{ nav|safe }}<main class="space-y-6">{{ content|safe }}</main>"""
+HISTORY_HTML = """
+<div class="rounded-3xl border border-slate-800 bg-gradient-to-br from-slate-900 to-slate-950 p-6 md:p-8">
+  <div class="text-xs tracking-[.35em] text-cyan-400">NOVA TRADE AI</div>
+  <h1 class="mt-2 text-3xl md:text-5xl font-black">Historique de trading</h1>
+  <p class="mt-3 text-slate-400 max-w-3xl">Une vue claire des opérations enregistrées par NOVA. Les données réelles apparaissent automatiquement lorsque le journal du bot est disponible.</p>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-6">
+    <div class="rounded-2xl bg-slate-950 border border-slate-800 p-4"><div class="text-xs text-slate-500">TRADES</div><div class="text-2xl font-bold">{{ stats.total }}</div></div>
+    <div class="rounded-2xl bg-slate-950 border border-slate-800 p-4"><div class="text-xs text-slate-500">WIN</div><div class="text-2xl font-bold text-emerald-400">{{ stats.win }}</div></div>
+    <div class="rounded-2xl bg-slate-950 border border-slate-800 p-4"><div class="text-xs text-slate-500">LOSS</div><div class="text-2xl font-bold text-red-400">{{ stats.loss }}</div></div>
+    <div class="rounded-2xl bg-slate-950 border border-slate-800 p-4"><div class="text-xs text-slate-500">P&L</div><div class="text-2xl font-bold">{{ '%.2f'|format(stats.pnl) }}</div></div>
+  </div>
+</div>
+<div class="rounded-2xl border border-slate-800 bg-slate-900 p-5 overflow-auto">
+  <div class="flex items-center justify-between mb-4"><h2 class="text-xl font-bold">📒 Journal NOVA</h2><a href="/" class="text-cyan-400 text-sm">Retour dashboard →</a></div>
+  <table class="w-full text-sm min-w-[720px]"><thead><tr class="text-slate-500"><th class="text-left py-3">Date</th><th class="text-left">Symbole</th><th class="text-left">Direction</th><th class="text-left">Entrée</th><th class="text-left">Résultat</th><th class="text-left">P&L</th><th></th></tr></thead><tbody>
+  {% for x in history %}<tr class="border-t border-slate-800 hover:bg-slate-950"><td class="py-3">{{ x.get('closed_at') or x.get('date') or x.get('created_at') or '—' }}</td><td>{{ x.get('symbol','—') }}</td><td>{{ x.get('direction','—') }}</td><td>{{ x.get('entry','—') }}</td><td><span class="rounded-lg px-2 py-1 {% if (x.get('result') or x.get('status')) in ['WIN','TP3_HIT'] %}bg-emerald-950 text-emerald-300{% elif (x.get('result') or x.get('status')) in ['LOSS','SL'] %}bg-red-950 text-red-300{% else %}bg-slate-800 text-slate-300{% endif %}">{{ x.get('result') or x.get('status') or '—' }}</span></td><td>{{ x.get('profit', x.get('pnl','—')) }}</td><td><button onclick='showTrade({{ x|tojson }})' class="text-cyan-400">Détails</button></td></tr>{% else %}<tr><td colspan="7" class="py-8 text-center text-slate-500">Aucun trade enregistré.</td></tr>{% endfor %}</tbody></table>
+</div>
+<div id="tradeModal" class="hidden fixed inset-0 z-50 bg-black/70 p-4" onclick="if(event.target===this)this.classList.add('hidden')"><div class="max-w-xl mx-auto mt-20 rounded-2xl border border-slate-700 bg-slate-900 p-6"><div class="flex justify-between"><h3 class="text-xl font-bold">Détail du trade</h3><button onclick="document.getElementById('tradeModal').classList.add('hidden')">✕</button></div><pre id="tradeDetails" class="mt-4 whitespace-pre-wrap text-sm text-slate-300"></pre></div></div>
+<script>function showTrade(x){document.getElementById('tradeDetails').textContent=JSON.stringify(x,null,2);document.getElementById('tradeModal').classList.remove('hidden')}</script>
+"""
+STRATEGY_HTML = """
+<div class="rounded-3xl border border-cyan-900 bg-gradient-to-br from-cyan-950/40 to-slate-950 p-7"><div class="text-xs tracking-[.35em] text-cyan-400">NOVA ENGINE</div><h1 class="mt-2 text-3xl md:text-5xl font-black">La stratégie NOVA</h1><p class="mt-4 max-w-3xl text-slate-300">NOVA combine Smart Money Concepts, Price Action et lecture de structure pour transformer un contexte M15 en exécution M5/M1.</p></div>
+<div class="grid md:grid-cols-2 xl:grid-cols-4 gap-4">
+{% for n,t,d in [('01','Contexte M15','Biais, BOS, zones majeures de support et résistance.'),('02','Liquidité M5','Recherche d’un sweep de liquidité et d’une réintégration cohérente.'),('03','CHoCH M1','Le changement de caractère valide le passage du contexte à l’exécution.'),('04','BOS + OB M1','Confirmation finale puis préparation de l’entrée, SL et TP1/TP2/TP3.') ]}<div class="rounded-2xl border border-slate-800 bg-slate-900 p-5"><div class="text-cyan-400 font-black text-2xl">{{ n }}</div><h2 class="font-bold mt-3">{{ t }}</h2><p class="text-sm text-slate-400 mt-2">{{ d }}</p></div>{% endfor %}</div>
+<div class="rounded-2xl border border-slate-800 bg-slate-900 p-6"><h2 class="text-xl font-bold">🎯 Gestion du risque</h2><div class="grid md:grid-cols-3 gap-4 mt-4"><div><b>TP1</b><p class="text-slate-400 text-sm">1R — première sécurisation.</p></div><div><b>TP2</b><p class="text-slate-400 text-sm">Objectif intermédiaire basé sur la structure.</p></div><div><b>TP3</b><p class="text-slate-400 text-sm">Extension vers l’extrême M15 avec contrôle du RR.</p></div></div></div>
+<div class="rounded-2xl border border-amber-900 bg-amber-950/20 p-5 text-sm text-amber-200">NOVA est un système d’analyse et d’exécution algorithmique. Les signaux ne constituent pas une garantie de résultat financier.</div>
+"""
+FOUNDER_HTML = """
+<div class="rounded-3xl border border-slate-800 bg-gradient-to-br from-slate-900 to-slate-950 p-7 md:p-10"><div class="text-xs tracking-[.35em] text-cyan-400">À PROPOS</div><h1 class="mt-2 text-3xl md:text-5xl font-black">Le fondateur de NOVA</h1><div class="mt-7 grid md:grid-cols-[180px_1fr] gap-7 items-center"><div class="h-40 w-40 rounded-3xl border border-cyan-800 bg-cyan-950/40 flex items-center justify-center text-5xl">N</div><div><h2 class="text-2xl font-bold">SAWADOGO CHEICK HAMED</h2><p class="mt-2 text-slate-400 leading-7">Fondateur et concepteur du projet NOVA TRADE AI. Le projet est pensé comme une infrastructure de trading algorithmique combinant analyse de marché, gestion des opportunités, suivi des positions, journalisation et interface utilisateur.</p><div class="flex flex-wrap gap-2 mt-4"><span class="rounded-full bg-slate-800 px-3 py-1 text-sm">NOVA TRADE AI</span><span class="rounded-full bg-slate-800 px-3 py-1 text-sm">Trading algorithmique</span><span class="rounded-full bg-slate-800 px-3 py-1 text-sm">SMC / Price Action</span></div></div></div></div>
+<div class="grid md:grid-cols-3 gap-4"><div class="rounded-2xl border border-slate-800 bg-slate-900 p-5"><b>Vision</b><p class="text-sm text-slate-400 mt-2">Construire un système lisible, discipliné et automatisable.</p></div><div class="rounded-2xl border border-slate-800 bg-slate-900 p-5"><b>Architecture</b><p class="text-sm text-slate-400 mt-2">Bot, journal, notifications Telegram et interface web séparés pour limiter les risques.</p></div><div class="rounded-2xl border border-slate-800 bg-slate-900 p-5"><b>Objectif</b><p class="text-sm text-slate-400 mt-2">Centraliser l’information du trader dans une expérience simple et professionnelle.</p></div></div>
+"""
+ROADMAP_HTML = """
+<div class="rounded-3xl border border-slate-800 bg-slate-900 p-7"><div class="text-xs tracking-[.35em] text-cyan-400">ÉVOLUTION</div><h1 class="mt-2 text-3xl md:text-5xl font-black">L’histoire et les prochaines étapes</h1><p class="mt-3 text-slate-400">Une timeline vivante du développement de NOVA.</p></div>
+<div class="space-y-4">{% for n,title,text in timeline %}<div class="flex gap-4"><div class="shrink-0 w-12 h-12 rounded-2xl bg-cyan-500 text-slate-950 font-black flex items-center justify-center">{{ n }}</div><div class="flex-1 rounded-2xl border border-slate-800 bg-slate-900 p-5"><h2 class="font-bold text-lg">{{ title }}</h2><p class="text-slate-400 mt-2">{{ text }}</p></div></div>{% endfor %}</div>
+"""
+FAQ_HTML = """
+<div class="rounded-3xl border border-slate-800 bg-slate-900 p-7"><div class="text-xs tracking-[.35em] text-cyan-400">CENTRE D’AIDE</div><h1 class="mt-2 text-3xl md:text-5xl font-black">FAQ NOVA</h1><div class="mt-6 space-y-3">{% for q,a in faqs %}<details class="rounded-2xl border border-slate-800 bg-slate-950 p-5"><summary class="cursor-pointer font-bold">{{ q }}</summary><p class="text-slate-400 mt-3 leading-6">{{ a }}</p></details>{% endfor %}</div></div>
+"""
+LOGIN_HTML = """<div class="max-w-md mx-auto mt-10 rounded-3xl border border-slate-800 bg-slate-900 p-7 shadow-2xl"><div class="text-3xl font-black">Connexion NOVA</div><p class="mt-2 text-slate-400">Retrouvez votre compte et votre abonnement sans créer un nouveau compte.</p><form method="post" class="mt-6 space-y-4"><input name="email" type="email" required placeholder="Email utilisé lors de l'inscription" class="w-full rounded-xl bg-slate-950 border border-slate-700 p-3"><button class="w-full rounded-xl bg-cyan-500 py-3 font-bold text-slate-950">Se connecter</button></form><a href="{{ url_for('register') }}" class="mt-5 block text-center text-sm text-cyan-400">Nouvel utilisateur ? Créer un compte</a></div>"""
+
 REGISTER_HTML = """{% extends_base %}<div class="min-h-[80vh] flex items-center justify-center"><div class="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl"><div class="text-xs tracking-[.3em] text-cyan-400">NOVA TRADE AI</div><h1 class="mt-2 text-3xl font-bold">Créer votre accès</h1><p class="mt-2 text-slate-400">Essai TRIAL de 7 jours avec accès complet au radar M15 et aux signaux M1.</p><form method="post" class="mt-6 space-y-3"><input name="username" required placeholder="Nom d'utilisateur" class="w-full rounded-xl bg-slate-950 border border-slate-700 p-3"><input name="email" type="email" required placeholder="Email" class="w-full rounded-xl bg-slate-950 border border-slate-700 p-3"><input name="telegram_user_id" placeholder="Telegram User ID (optionnel)" class="w-full rounded-xl bg-slate-950 border border-slate-700 p-3"><button class="w-full rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold p-3">Démarrer mon essai 7 jours</button></form></div></div>"""
 ADMIN_LOGIN_HTML = """{% extends_base %}<div class="min-h-[80vh] flex items-center justify-center"><div class="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6"><div class="text-xs tracking-[.3em] text-cyan-400">NOVA ADMIN</div><h1 class="mt-2 text-2xl font-bold">Connexion</h1><form method="post" class="mt-5 space-y-3"><input type="password" name="password" required placeholder="Mot de passe admin" class="w-full rounded-xl bg-slate-950 border border-slate-700 p-3"><button class="w-full rounded-xl bg-cyan-500 text-slate-950 font-bold p-3">Entrer</button></form></div></div>"""
 PAYMENT_HTML = """{% extends_base %}<div class="flex items-center justify-between mb-6"><div><div class="text-xs tracking-[.3em] text-cyan-400">NOVA VIP</div><h1 class="text-3xl font-bold">Réabonnement</h1></div><a href="/" class="text-cyan-400">← Dashboard</a></div><div class="grid md:grid-cols-2 gap-4">{% for k,v in mobile_money.items() %}<div class="rounded-2xl border border-slate-800 bg-slate-900 p-5"><h2 class="font-bold">{{ k }} Money</h2><div class="mt-2 text-slate-300 break-all">{{ v }}</div></div>{% endfor %}{% for k,v in usdt.items() %}<div class="rounded-2xl border border-slate-800 bg-slate-900 p-5"><h2 class="font-bold">USDT {{ k }}</h2><div class="mt-2 text-slate-300 break-all">{{ v }}</div></div>{% endfor %}</div><form method="post" class="mt-6 rounded-2xl border border-slate-800 bg-slate-900 p-5 space-y-3"><select name="payment_method" required class="w-full rounded-xl bg-slate-950 border border-slate-700 p-3"><option value="">Méthode de paiement</option><option>ORANGE</option><option>MOOV</option><option>WAVE</option><option>USDT TRC20</option><option>USDT ERC20</option></select><input name="payment_reference" required placeholder="Référence / TXID" class="w-full rounded-xl bg-slate-950 border border-slate-700 p-3"><button class="rounded-xl bg-emerald-500 text-slate-950 font-bold px-5 py-3">Soumettre le paiement</button></form>"""
-DASHBOARD_HTML = """{% extends_base %}<header class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6"><div><div class="text-xs tracking-[.3em] text-cyan-400">NOVA TRADE AI</div><h1 class="text-3xl font-bold">Dashboard</h1><div class="text-slate-400">{{ user.username }} · <span id="status">{{ user.access_status }}</span></div></div><div class="flex gap-2"><a href="/payment" class="rounded-xl bg-cyan-500 text-slate-950 font-bold px-4 py-2">VIP</a><a href="/logout" class="rounded-xl border border-slate-700 px-4 py-2">Sortir</a></div></header><div id="trial" class="hidden mb-5 rounded-2xl border border-cyan-900 bg-cyan-950/30 p-4"><b>Essai TRIAL</b><div id="countdown" class="text-2xl font-mono mt-1"></div></div><div id="expired" class="hidden rounded-2xl border border-red-900 bg-red-950/30 p-8 text-center"><div class="text-5xl">🔒</div><h2 class="text-2xl font-bold mt-3">Accès expiré</h2><p class="text-slate-400 mt-2">Réabonnez-vous pour retrouver le radar et les signaux.</p><a href="/payment" class="inline-block mt-5 rounded-xl bg-cyan-500 text-slate-950 font-bold px-5 py-3">Se réabonner</a></div><div id="app" class="space-y-6"></div><script>
+DASHBOARD_HTML = """{% extends_base %}{{ nav|safe }}<header class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6"><div><div class="text-xs tracking-[.3em] text-cyan-400">NOVA TRADE AI</div><h1 class="text-3xl font-bold">Dashboard</h1><div class="text-slate-400">{{ user.username }} · <span id="status">{{ user.access_status }}</span></div></div><div class="flex gap-2"><a href="/payment" class="rounded-xl bg-cyan-500 text-slate-950 font-bold px-4 py-2">VIP</a><a href="/logout" class="rounded-xl border border-slate-700 px-4 py-2">Sortir</a></div></header><div id="trial" class="hidden mb-5 rounded-2xl border border-cyan-900 bg-cyan-950/30 p-4"><b>Essai TRIAL</b><div id="countdown" class="text-2xl font-mono mt-1"></div></div><div id="expired" class="hidden rounded-2xl border border-red-900 bg-red-950/30 p-8 text-center"><div class="text-5xl">🔒</div><h2 class="text-2xl font-bold mt-3">Accès expiré</h2><p class="text-slate-400 mt-2">Réabonnez-vous pour retrouver le radar et les signaux.</p><a href="/payment" class="inline-block mt-5 rounded-xl bg-cyan-500 text-slate-950 font-bold px-5 py-3">Se réabonner</a></div><div id="app" class="space-y-6"></div><script>
 const initial={{ data|tojson }}; let expires={{ (user.subscription_expires_at|tojson) }}; const initialUser={{ user|tojson }};
 function esc(x){return String(x??'').replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#039;'}[m]));}
 function card(title,html){return `<section class="rounded-2xl border border-slate-800 bg-slate-900 p-5"><h2 class="font-bold text-lg mb-4">${title}</h2>${html}</section>`}
@@ -65,7 +130,20 @@ def update(uid,**kw):
     with DB_LOCK:
         c=conn(); c.execute('UPDATE users SET '+','.join(f'{k}=?' for k in kw)+' WHERE user_id=?',[*kw.values(),uid]);c.commit();c.close()
 
+def find_user_by_email(email):
+    email=(email or '').strip().lower()
+    if not email:return None
+    with DB_LOCK:
+        c=conn();x=c.execute('SELECT * FROM users WHERE lower(email)=? ORDER BY created_at ASC LIMIT 1',(email,)).fetchone();c.close()
+    if not x:return None
+    x=dict(x);x['has_received_3day_warning']=bool(x['has_received_3day_warning']);return refresh(x)
+
 def create_user(name,email,tg):
+    email=(email or '').strip().lower(); existing=find_user_by_email(email)
+    if existing:
+        if tg and not existing.get('telegram_user_id'):update(existing['user_id'],telegram_user_id=tg,last_ip=request.remote_addr or '')
+        else:update(existing['user_id'],last_ip=request.remote_addr or '')
+        return user(existing['user_id'])
     t=now(); uid=secrets.token_urlsafe(12); exp=t+timedelta(days=7)
     with DB_LOCK:
         c=conn();c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,name,email,tg,iso(t),'TRIAL',iso(exp),0,request.remote_addr or '', '', '',iso(t),iso(t)));c.commit();c.close()
@@ -148,6 +226,7 @@ def dashboard_data():
 
 def page(template, **ctx):
     tpl=globals()[template]
+    ctx.setdefault('nav', NAV_HTML)
     body=render_template_string(tpl.replace('{% extends_base %}',''), **ctx)
     return render_template_string(BASE_HTML, body=body, **ctx)
 
@@ -160,11 +239,29 @@ def admin_required(f):
 @app.route('/register',methods=['GET','POST'])
 def register():
     if request.method=='POST':
-        if not request.form.get('username') or not request.form.get('email'):flash('Nom et email requis.','error');return redirect(url_for('register'))
-        u=create_user(request.form['username'].strip(),request.form['email'].strip(),request.form.get('telegram_user_id','').strip());session['uid']=u['user_id'];return redirect('/')
-    return page('REGISTER_HTML', title='NOVA — Inscription')
+        name=request.form.get('username','').strip();email=request.form.get('email','').strip().lower();tg=request.form.get('telegram_user_id','').strip()
+        if not name or not email:flash('Nom et email requis.','error');return redirect(url_for('register'))
+        existing=find_user_by_email(email)
+        if existing:
+            if existing.get('username') and name and name != existing['username']:
+                flash('Compte existant retrouvé. Votre abonnement et vos données ont été conservés.','success')
+            if tg and not existing.get('telegram_user_id'):update(existing['user_id'],telegram_user_id=tg,last_ip=request.remote_addr or '')
+            else:update(existing['user_id'],last_ip=request.remote_addr or '')
+            session['uid']=existing['user_id'];return redirect('/')
+        u=create_user(name,email,tg);session['uid']=u['user_id'];return redirect('/')
+    return page('REGISTER_HTML', title='NOVA — Inscription / Connexion')
+@app.route('/login',methods=['GET','POST'])
+def login():
+    if request.method=='POST':
+        email=request.form.get('email','').strip().lower()
+        u=find_user_by_email(email)
+        if not u:
+            flash('Aucun compte NOVA trouvé avec cet email.','error');return redirect(url_for('login'))
+        update(u['user_id'],last_ip=request.remote_addr or '')
+        session['uid']=u['user_id'];return redirect('/')
+    return page('LOGIN_HTML', title='NOVA — Connexion')
 @app.route('/logout')
-def logout():session.pop('uid',None);return redirect(url_for('register'))
+def logout():session.pop('uid',None);return redirect(url_for('login'))
 @app.route('/')
 def index():
     u=current();return redirect(url_for('register')) if not u else page('DASHBOARD_HTML', title='NOVA — Dashboard', user=u, data=dashboard_data())
@@ -222,6 +319,57 @@ def panic():
 def panic_reset():
     with PANIC_LOCK:PANIC.update(active=False,requested_at=None)
     return redirect(url_for('admin_dashboard'))
+
+def history_records():
+    h=vals(json_load('trade_history.json',{}))
+    if DEMO and not h:
+        h=[
+            {'trade_id':'DEMO-H1','symbol':'EURUSD','direction':'BUY','entry':1.17250,'result':'WIN','profit':182.40,'closed_at':'2026-10-02 14:22'},
+            {'trade_id':'DEMO-H2','symbol':'GBPUSD','direction':'SELL','entry':1.35120,'result':'LOSS','profit':-74.20,'closed_at':'2026-10-02 10:15'},
+            {'trade_id':'DEMO-H3','symbol':'XAUUSD','direction':'BUY','entry':3848.20,'result':'TP3_HIT','profit':321.60,'closed_at':'2026-10-01 18:41'},
+            {'trade_id':'DEMO-H4','symbol':'BTCUSD','direction':'SELL','entry':108420.00,'result':'SL','profit':-95.00,'closed_at':'2026-10-01 12:07'},
+        ]
+    return h[::-1] if h else []
+
+@app.route('/history')
+def history_page():
+    h=history_records(); win=sum(1 for x in h if x.get('result') in ('WIN','TP3_HIT')); loss=sum(1 for x in h if x.get('result') in ('LOSS','SL'))
+    pnl=sum(float(x.get('profit',x.get('pnl',0)) or 0) for x in h if isinstance(x,dict))
+    return page('PUBLIC_HTML',title='NOVA — Historique',content=render_template_string(HISTORY_HTML,history=h,stats={'total':len(h),'win':win,'loss':loss,'pnl':pnl}))
+
+@app.route('/strategy')
+def strategy_page():
+    return page('PUBLIC_HTML',title='NOVA — Stratégie',content=render_template_string(STRATEGY_HTML))
+
+@app.route('/founder')
+def founder_page():
+    return page('PUBLIC_HTML',title='NOVA — Fondateur',content=render_template_string(FOUNDER_HTML))
+
+@app.route('/roadmap')
+def roadmap_page():
+    timeline=[
+        ('01','Conception de NOVA','Création de l’idée NOVA TRADE AI autour d’une approche structurée du marché et de l’automatisation.'),
+        ('02','Structure SMC + Price Action','Mise en place de la lecture de structure, des zones, BOS et configurations Price Action.'),
+        ('03','Pipeline M15 → M5 → M1','Séparation du contexte, de la liquidité et de la confirmation d’exécution.'),
+        ('04','Journal & suivi','Ajout du suivi des opportunités, positions, résultats et historique des trades.'),
+        ('05','Écosystème Telegram','Séparation des alertes publiques et du contrôle privé du propriétaire.'),
+        ('06','Site NOVA','Création d’une interface web avec dashboard, CRM VIP, paiements, historique et documentation.'),
+        ('07','Prochaine phase','Connexion contrôlée entre le site et le bot après validation complète de l’interface.')
+    ]
+    return page('PUBLIC_HTML',title='NOVA — Évolution',content=render_template_string(ROADMAP_HTML,timeline=timeline))
+
+@app.route('/faq')
+def faq_page():
+    faqs=[
+        ('NOVA exécute-t-il automatiquement les trades ?','Le Site NOVA de test est indépendant de main.py. Il affiche et organise les informations sans modifier le moteur de trading.'),
+        ('Quels marchés sont suivis ?','BTCUSD, XAUUSD, EURUSD et GBPUSD font partie du périmètre NOVA actuel.'),
+        ('Pourquoi M15, M5 et M1 ?','M15 sert au contexte et aux zones, M5 à la liquidité et M1 à la confirmation d’exécution.'),
+        ('Que contient le journal ?','Les opérations enregistrées peuvent afficher le symbole, la direction, l’entrée, le résultat, le P&L et les informations disponibles dans trade_history.json.'),
+        ('Quelle est la différence TRIAL et VIP ?','Le TRIAL dure 7 jours. Le VIP donne accès aux fonctions premium et au lien du canal Telegram privé.'),
+        ('Le Site NOVA modifie-t-il mon bot ?','Non dans cette phase de test. Le site lit éventuellement les fichiers JSON du bot mais ne les modifie pas.')
+    ]
+    return page('PUBLIC_HTML',title='NOVA — FAQ',content=render_template_string(FAQ_HTML,faqs=faqs))
+
 @app.route('/health')
 def health():return jsonify(status='ok',service='Site NOVA',mode='DEMO' if DEMO else 'LIVE')
 
