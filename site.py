@@ -9,7 +9,7 @@ BASE=Path(__file__).resolve().parent
 DB=BASE/'nova_site.db'
 DEMO=os.getenv('NOVA_SITE_DEMO_MODE','true').lower() in ('1','true','yes','on')
 TOKEN=os.getenv('TELEGRAM_BOT_TOKEN','').strip(); CHAT=os.getenv('TELEGRAM_PRIVATE_CHAT_ID','').strip()
-ADMIN=os.getenv('NOVA_ADMIN_PASSWORD',''); SECRET=os.getenv('NOVA_SITE_SECRET',secrets.token_hex(32))
+ADMIN='NOVA-ADMIN-2026'; SECRET=os.getenv('NOVA_SITE_SECRET',secrets.token_hex(32))
 MM={'ORANGE':os.getenv('NOVA_ORANGE_MONEY','À CONFIGURER'),'MOOV':os.getenv('NOVA_MOOV_MONEY','À CONFIGURER'),'WAVE':os.getenv('NOVA_WAVE_MONEY','À CONFIGURER')}
 USDT={'TRC20':os.getenv('NOVA_USDT_TRC20','À CONFIGURER'),'ERC20':os.getenv('NOVA_USDT_ERC20','À CONFIGURER')}
 app=Flask(__name__); app.secret_key=SECRET
