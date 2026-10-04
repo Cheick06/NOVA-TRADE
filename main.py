@@ -1880,7 +1880,6 @@ def telegram_polling_loop():
 
 def is_trading_session(now=None):
     return True
-        return False
 
 
 def _daily_tracker_state():
