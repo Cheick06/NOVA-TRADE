@@ -30,7 +30,10 @@ TELEGRAM_CHANNEL_ID = os.environ.get(
     ""
 ).strip()
 
-TELEGRAM_OWNER_ID = "5459538739"
+TELEGRAM_OWNER_ID = os.environ.get(
+    "TELEGRAM_OWNER_ID",
+    "5459538739"
+).strip()
 
 # Les 4 actifs surveillés
 SYMBOLS = [
