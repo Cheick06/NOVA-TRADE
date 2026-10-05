@@ -4663,6 +4663,14 @@ def _build_owner_chart_png(symbol, timeframe):
                     except (TypeError, ValueError):
                         pass
 
+    for liquidity in overlays.get("liquidity", []):
+        value = liquidity.get("level")
+        if value is not None:
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError):
+                pass
+
     if not values:
         return None
 
@@ -4770,6 +4778,21 @@ def _build_owner_chart_png(symbol, timeframe):
 
     for z in overlays.get("fvgs", []):
         draw_zone(z, (110, 88, 20))
+
+    # Liquidité M5 réellement surveillée par la stratégie.
+    # Le bot attend un sweep de la limite externe de la zone M15 :
+    # - BUY/HAUSSIER : liquidité sous le support
+    # - SELL/BAISSIER : liquidité au-dessus de la résistance
+    for liq in overlays.get("liquidity", []):
+        try:
+            level = float(liq.get("level"))
+            y = py(level)
+            line(left, y, width - right, y, (34, 211, 238), 3)
+            # Petite extension verticale pour rendre le niveau très visible.
+            line(left, y - 4, left, y + 4, (34, 211, 238), 2)
+            line(width - right, y - 4, width - right, y + 4, (34, 211, 238), 2)
+        except (TypeError, ValueError):
+            pass
 
     # Prix clés
     key_lines = (
@@ -4902,6 +4925,76 @@ def _owner_chart_data(symbol, timeframe):
         state = dict(M15_ZONE_STATE.get(symbol, {}))
         zones = [dict(x) for x in M15_ZONES.get(symbol, [])]
 
+    liquidity = []
+    try:
+        with JSON_LOCK:
+            opportunities = load_json(OPPORTUNITIES_FILE)
+
+        for opportunity in opportunities.values():
+            if str(opportunity.get("symbol", "")).upper() != str(symbol).upper():
+                continue
+            if opportunity.get("status") not in {
+                "WAITING_M5_LIQUIDITY",
+                "WAITING_M1_CHOCH",
+                "WAITING_M1_BOS"
+            }:
+                continue
+
+            direction = str(opportunity.get("direction", "")).upper()
+            zmin = opportunity.get("m15_zone_min")
+            zmax = opportunity.get("m15_zone_max")
+            if zmin is None or zmax is None:
+                continue
+
+            # C'est exactement la limite utilisée par check_m5_liquidity().
+            if direction == "HAUSSIER":
+                level = float(zmin)
+                side = "SELL_SIDE_LIQUIDITY"
+            elif direction == "BAISSIER":
+                level = float(zmax)
+                side = "BUY_SIDE_LIQUIDITY"
+            else:
+                continue
+
+            item = {
+                "level": level,
+                "side": side,
+                "direction": direction,
+                "status": opportunity.get("status"),
+                "timestamp": opportunity.get("m5_liquidity_timestamp")
+            }
+
+            # Après un sweep M5 confirmé, on remplace le seuil théorique
+            # par l'extrême réel de la bougie de manipulation.
+            liquidity_timestamp = opportunity.get("m5_liquidity_timestamp")
+            if liquidity_timestamp:
+                try:
+                    df_m5 = fetch_market_data_safe(symbol, "5m", limit=300)
+                    if df_m5 is not None and not df_m5.empty:
+                        matches = df_m5[df_m5.index.astype(str) == str(liquidity_timestamp)]
+                        if not matches.empty:
+                            candle = matches.iloc[-1]
+                            item["level"] = (
+                                float(candle["low"])
+                                if direction == "HAUSSIER"
+                                else float(candle["high"])
+                            )
+                            item["status"] = "SWEEP_DETECTED"
+                except Exception:
+                    pass
+
+            duplicate = any(
+                x.get("side") == item["side"]
+                and abs(float(x.get("level")) - float(item["level"])) <= max(abs(float(item["level"])) * 0.000001, 1e-12)
+                for x in liquidity
+            )
+            if not duplicate:
+                liquidity.append(item)
+    except Exception as exc:
+        logging.warning(
+            f"[OWNER CHART] Lecture liquidité impossible pour {symbol}: {exc}"
+        )
+
     return {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -4910,6 +5003,7 @@ def _owner_chart_data(symbol, timeframe):
             "zones": zones,
             "order_blocks": [dict(x) for x in state.get("order_blocks", [])],
             "fvgs": [dict(x) for x in state.get("fvgs", [])],
+            "liquidity": liquidity,
             "bias": state.get("bias"),
             "bos": state.get("bos"),
             "bos_level": state.get("bos_level"),
