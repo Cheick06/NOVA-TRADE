@@ -4541,6 +4541,27 @@ def _owner_chart_authorized(symbol, timeframe, token):
     return bool(token) and token == _owner_chart_token(symbol, timeframe)
 
 
+OWNER_CHART_DISCOVERED_BASE_URL = ""
+OWNER_CHART_BASE_URL_LOCK = threading.RLock()
+
+
+def _remember_owner_chart_public_base_url_from_request():
+    global OWNER_CHART_DISCOVERED_BASE_URL
+    try:
+        host = (request.headers.get("X-Forwarded-Host", "") or request.host or "").strip()
+        if not host or host.startswith(("127.", "localhost", "0.0.0.0", "10.", "172.", "192.168.")):
+            return
+        forwarded_proto = (request.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip()
+        scheme = forwarded_proto if forwarded_proto in {"http", "https"} else request.scheme
+        if scheme not in {"http", "https"}:
+            scheme = "https"
+        discovered = f"{scheme}://{host}".rstrip("/")
+        with OWNER_CHART_BASE_URL_LOCK:
+            OWNER_CHART_DISCOVERED_BASE_URL = discovered
+    except Exception:
+        pass
+
+
 def _owner_chart_public_base_url():
     base = (os.environ.get("PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
     if base:
@@ -4548,10 +4569,17 @@ def _owner_chart_public_base_url():
     railway_domain = (os.environ.get("RAILWAY_PUBLIC_DOMAIN", "") or "").strip()
     if railway_domain:
         return railway_domain if railway_domain.startswith("http") else f"https://{railway_domain}"
+    railway_static_url = (os.environ.get("RAILWAY_STATIC_URL", "") or "").strip().rstrip("/")
+    if railway_static_url:
+        return railway_static_url
     render_url = (os.environ.get("RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
     if render_url:
         return render_url
-    return ""
+    render_hostname = (os.environ.get("RENDER_EXTERNAL_HOSTNAME", "") or "").strip()
+    if render_hostname:
+        return render_hostname if render_hostname.startswith("http") else f"https://{render_hostname}"
+    with OWNER_CHART_BASE_URL_LOCK:
+        return OWNER_CHART_DISCOVERED_BASE_URL
 
 
 def build_owner_chart_url(symbol, timeframe, owner_id):
@@ -4651,6 +4679,7 @@ chart.timeScale().fitContent();drawZones();
 
 @app.route("/owner/chart")
 def owner_chart():
+    _remember_owner_chart_public_base_url_from_request()
     symbol = (request.args.get("symbol", "") or "").upper().strip()
     timeframe = (request.args.get("timeframe", "") or "").lower().strip()
     token = (request.args.get("token", "") or "").strip()
@@ -4676,6 +4705,8 @@ def owner_chart():
 @app.route("/")
 @app.route("/health")
 def health_check():
+
+    _remember_owner_chart_public_base_url_from_request()
 
     return {
         "status": "healthy",
