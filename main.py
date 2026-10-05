@@ -1751,11 +1751,17 @@ def handle_telegram_callback(
                 )
                 return
 
+            chart_data = OWNER_CHART_LAST_DATA.get((symbol, timeframe), {})
+            overlays = chart_data.get("overlays", {})
             caption = (
                 f"📈 *NOVA — {symbol} {timeframe.upper()}*\n"
-                f"Bias M15 : {(_owner_chart_data(symbol, '15m') or {}).get('overlays', {}).get('bias') or 'N/A'}\n"
-                "Graphique généré directement par NOVA.\n"
-                "Les zones affichées correspondent aux éléments SMC détectés."
+                f"Bias M15 : {overlays.get('bias') or 'N/A'}\n"
+                f"S/R : {len(overlays.get('zones', []))} | "
+                f"OB : {len(overlays.get('order_blocks', []))} | "
+                f"FVG : {len(overlays.get('fvgs', []))} | "
+                f"Liquidité : {len(overlays.get('liquidity', []))}\n"
+                "M15 = cartographie macro → M5 = sweep/liquidité → M1 = CHoCH/BOS.\n"
+                "Les zones affichées sont recalculées sur les 300 bougies M15."
             )
 
             if not send_telegram_owner_photo(chart_png, caption):
@@ -3068,23 +3074,92 @@ def _detect_m15_fvgs(df,lookback=150):
         if float(c["high"])<float(a["low"]):bear.append({"type":"BEARISH_FVG","index":i,"timestamp":str(data.index[i]),"lower":float(c["high"]),"upper":float(a["low"])})
     return bull[-20:],bear[-20:]
 
+def _detect_m15_liquidity(data, atr, symbol, max_levels=12):
+    """Cartographie VISUELLE des pools de liquidité M15.
+
+    Cette cartographie ne modifie pas la logique d'entrée. Elle permet au
+    graphique propriétaire de montrer les buy-side/sell-side liquidity que
+    le radar M15 peut surveiller avant le sweep M5.
+    """
+    piv = detect_pivots(data, window=5)
+    result = []
+
+    def clusters(points, side):
+        if not points:
+            return
+        ordered = sorted(points, key=lambda item: float(item["price"]))
+        groups = []
+        current = [ordered[0]]
+        for point in ordered[1:]:
+            center = float(np.mean([float(x["price"]) for x in current]))
+            width = _m15_zone_width(center, atr, symbol)
+            if abs(float(point["price"]) - center) <= width * 1.5:
+                current.append(point)
+            else:
+                groups.append(current)
+                current = [point]
+        groups.append(current)
+
+        for group in groups:
+            center = float(np.mean([float(x["price"]) for x in group]))
+            width = _m15_zone_width(center, atr, symbol) * 0.35
+            result.append({
+                "level": center,
+                "zone_min": center - width,
+                "zone_max": center + width,
+                "side": side,
+                "touches": len(group),
+                "timestamp": str(group[-1].get("timestamp", "")),
+            })
+
+    highs = []
+    for _, row in piv["highs"].iterrows():
+        idx = int(row["index"])
+        highs.append({
+            "price": float(row["price"]),
+            "timestamp": str(data.index[idx])
+        })
+
+    lows = []
+    for _, row in piv["lows"].iterrows():
+        idx = int(row["index"])
+        lows.append({
+            "price": float(row["price"]),
+            "timestamp": str(data.index[idx])
+        })
+
+    clusters(highs, "BUY_SIDE_LIQUIDITY")
+    clusters(lows, "SELL_SIDE_LIQUIDITY")
+
+    result.sort(key=lambda item: item["timestamp"])
+    return result[-max_levels:]
+
+
 def build_m15_major_zones(df,symbol,window=5):
     symbol=str(symbol).upper()
     if symbol not in M15_ZONE_BUFFER_PCT:raise ValueError(f"Symbole non supporté: {symbol}")
-    if df is None or df.empty:return {"zones":[],"bias":None,"bos":None,"bos_level":None,"order_blocks":[],"fvgs":[],"macro_high":None,"macro_low":None}
+    if df is None or df.empty:return {"zones":[],"display_zones":[],"liquidity":[],"bias":None,"bos":None,"bos_level":None,"order_blocks":[],"fvgs":[],"macro_high":None,"macro_low":None}
     data=df.copy();data.columns=[str(c).strip().lower() for c in data.columns]
     for col in ("open","high","low","close"):data[col]=pd.to_numeric(data[col],errors="coerce")
     data=data.dropna(subset=["open","high","low","close"])
-    atr=float(_m15_zone_atr(data,M15_ZONE_ATR_PERIOD).iloc[-1]);piv=detect_pivots(data,window);hi=piv["highs"]["price"].tolist();lo=piv["lows"]["price"].tolist();levels=hi+lo;types=["RESISTANCE"]*len(hi)+["SUPPORT"]*len(lo);zones=[]
+    if len(data)<20:return {"zones":[],"display_zones":[],"liquidity":[],"bias":None,"bos":None,"bos_level":None,"order_blocks":[],"fvgs":[],"macro_high":None,"macro_low":None}
+    atr=float(_m15_zone_atr(data,M15_ZONE_ATR_PERIOD).iloc[-1]);piv=detect_pivots(data,window);hi=piv["highs"]["price"].tolist();lo=piv["lows"]["price"].tolist();levels=hi+lo;types=["RESISTANCE"]*len(hi)+["SUPPORT"]*len(lo);zones=[];display_zones=[]
     for level,typ in _cluster_m15_pivots(levels,types,atr,symbol):
         w=_m15_zone_width(level,atr,symbol);touch=_m15_zone_touch_count(data,level,w,typ)
-        if touch>=M15_ZONE_MIN_TOUCHES:zones.append({"level_type":typ,"zone_min":float(level-w),"zone_max":float(level+w),"touches":touch,"is_active":True})
+        zone={"level_type":typ,"zone_min":float(level-w),"zone_max":float(level+w),"touches":touch,"is_active":True,"trade_eligible":touch>=M15_ZONE_MIN_TOUCHES}
+        display_zones.append(dict(zone))
+        if touch>=M15_ZONE_MIN_TOUCHES:zones.append(dict(zone))
     closed=data.iloc[:-1] if len(data)>1 else data;ema20=closed["close"].ewm(span=20,adjust=False).mean().iloc[-1];ema50=closed["close"].ewm(span=50,adjust=False).mean().iloc[-1];bias="BULLISH" if ema20>ema50 else "BEARISH" if ema20<ema50 else None;bos=None;bos_level=None;last=data.iloc[-2]
     for z in zones:
         if z["level_type"]=="RESISTANCE" and float(last["close"])>z["zone_max"] and float(last["close"])>=float(last["open"]):z["is_active"]=False;bos,bos_level=("BULLISH_BOS",float(z["zone_max"])) if bos is None or z["zone_max"]>bos_level else (bos,bos_level)
         elif z["level_type"]=="SUPPORT" and float(last["close"])<z["zone_min"] and float(last["close"])<=float(last["open"]):z["is_active"]=False;bos,bos_level=("BEARISH_BOS",float(z["zone_min"])) if bos is None or bos_level is None or z["zone_min"]<bos_level else (bos,bos_level)
-    ob1,ob2=_detect_m15_order_blocks(data);fv1,fv2=_detect_m15_fvgs(data)
-    return {"zones":zones,"bias":bias,"bos":bos,"bos_level":bos_level,"order_blocks":ob1+ob2,"fvgs":fv1+fv2,"macro_high":float(data["high"].max()),"macro_low":float(data["low"].min())}
+    for z in display_zones:
+        for active in zones:
+            if z["level_type"]==active["level_type"] and abs(float(z["zone_min"])-float(active["zone_min"]))<=1e-12:
+                z["is_active"]=active.get("is_active",True)
+                break
+    ob1,ob2=_detect_m15_order_blocks(data);fv1,fv2=_detect_m15_fvgs(data);liquidity=_detect_m15_liquidity(data,atr,symbol)
+    return {"zones":zones,"display_zones":display_zones,"liquidity":liquidity,"bias":bias,"bos":bos,"bos_level":bos_level,"order_blocks":ob1+ob2,"fvgs":fv1+fv2,"macro_high":float(data["high"].max()),"macro_low":float(data["low"].min())}
 
 def update_m15_major_zones(df, symbol, window=5):
     state = build_m15_major_zones(df, symbol, window)
@@ -3095,8 +3170,10 @@ def update_m15_major_zones(df, symbol, window=5):
             "bias": state["bias"],
             "bos": state["bos"],
             "bos_level": state["bos_level"],
+            "display_zones": [dict(x) for x in state.get("display_zones",[])],
             "order_blocks": [dict(x) for x in state.get("order_blocks",[])],
             "fvgs": [dict(x) for x in state.get("fvgs",[])],
+            "liquidity": [dict(x) for x in state.get("liquidity",[])],
             "macro_high": state.get("macro_high"),
             "macro_low": state.get("macro_low"),
             "updated_at": datetime.now(timezone.utc).isoformat()
@@ -4620,6 +4697,8 @@ def _png_chunk(chunk_type, data):
     )
 
 
+OWNER_CHART_LAST_DATA = {}
+
 def _build_owner_chart_png(symbol, timeframe):
     """
     Génère directement en mémoire un PNG du marché.
@@ -4629,6 +4708,7 @@ def _build_owner_chart_png(symbol, timeframe):
     if not chart or not chart.get("candles"):
         return None
 
+    OWNER_CHART_LAST_DATA[(str(symbol).upper(), str(timeframe).lower())] = chart
     candles = chart["candles"][-180:]
     overlays = chart.get("overlays", {})
 
@@ -4903,6 +4983,12 @@ def send_telegram_owner_photo(photo_bytes, caption):
 
 
 def _owner_chart_data(symbol, timeframe):
+    symbol = str(symbol).upper().strip()
+    timeframe = str(timeframe).lower().strip()
+    if symbol not in SYMBOLS or timeframe not in {"1m", "5m", "15m"}:
+        return None
+
+    # Les chandeliers suivent le timeframe demandé.
     df = fetch_market_data_safe(symbol, timeframe, limit=300)
     if df is None or df.empty:
         return None
@@ -4921,17 +5007,23 @@ def _owner_chart_data(symbol, timeframe):
         except Exception:
             continue
 
-    with M15_ZONE_LOCK:
-        state = dict(M15_ZONE_STATE.get(symbol, {}))
-        zones = [dict(x) for x in M15_ZONES.get(symbol, [])]
+    # La cartographie macro est TOUJOURS recalculée sur les 300 bougies M15
+    # au moment où le propriétaire demande le graphique. Cela évite le N/A
+    # provoqué par un état mémoire encore vide et garantit une visualisation
+    # cohérente avec le radar M15 -> M5 -> M1. Cette opération ne modifie pas
+    # les règles d'entrée du bot.
+    df_m15 = fetch_market_data_safe(symbol, "15m", limit=300)
+    m15_state = build_m15_major_zones(df_m15, symbol, window=5) if df_m15 is not None and not df_m15.empty else {}
 
-    liquidity = []
+    # Les liquidités dynamiques déjà suivies par M5 sont ajoutées à la
+    # cartographie M15 afin de distinguer le niveau théorique du sweep réel.
+    liquidity = [dict(x) for x in m15_state.get("liquidity", [])]
     try:
         with JSON_LOCK:
             opportunities = load_json(OPPORTUNITIES_FILE)
 
         for opportunity in opportunities.values():
-            if str(opportunity.get("symbol", "")).upper() != str(symbol).upper():
+            if str(opportunity.get("symbol", "")).upper() != symbol:
                 continue
             if opportunity.get("status") not in {
                 "WAITING_M5_LIQUIDITY",
@@ -4946,7 +5038,6 @@ def _owner_chart_data(symbol, timeframe):
             if zmin is None or zmax is None:
                 continue
 
-            # C'est exactement la limite utilisée par check_m5_liquidity().
             if direction == "HAUSSIER":
                 level = float(zmin)
                 side = "SELL_SIDE_LIQUIDITY"
@@ -4964,8 +5055,6 @@ def _owner_chart_data(symbol, timeframe):
                 "timestamp": opportunity.get("m5_liquidity_timestamp")
             }
 
-            # Après un sweep M5 confirmé, on remplace le seuil théorique
-            # par l'extrême réel de la bougie de manipulation.
             liquidity_timestamp = opportunity.get("m5_liquidity_timestamp")
             if liquidity_timestamp:
                 try:
@@ -4987,29 +5076,30 @@ def _owner_chart_data(symbol, timeframe):
                 x.get("side") == item["side"]
                 and abs(float(x.get("level")) - float(item["level"])) <= max(abs(float(item["level"])) * 0.000001, 1e-12)
                 for x in liquidity
+                if x.get("level") is not None
             )
             if not duplicate:
                 liquidity.append(item)
     except Exception as exc:
-        logging.warning(
-            f"[OWNER CHART] Lecture liquidité impossible pour {symbol}: {exc}"
-        )
+        logging.warning(f"[OWNER CHART] Lecture liquidité dynamique impossible pour {symbol}: {exc}")
 
     return {
         "symbol": symbol,
         "timeframe": timeframe,
         "candles": candles,
         "overlays": {
-            "zones": zones,
-            "order_blocks": [dict(x) for x in state.get("order_blocks", [])],
-            "fvgs": [dict(x) for x in state.get("fvgs", [])],
+            "zones": [dict(x) for x in m15_state.get("display_zones", m15_state.get("zones", []))],
+            "active_zones": [dict(x) for x in m15_state.get("zones", [])],
+            "order_blocks": [dict(x) for x in m15_state.get("order_blocks", [])],
+            "fvgs": [dict(x) for x in m15_state.get("fvgs", [])],
             "liquidity": liquidity,
-            "bias": state.get("bias"),
-            "bos": state.get("bos"),
-            "bos_level": state.get("bos_level"),
-            "macro_high": state.get("macro_high"),
-            "macro_low": state.get("macro_low"),
-            "updated_at": state.get("updated_at")
+            "bias": m15_state.get("bias"),
+            "bos": m15_state.get("bos"),
+            "bos_level": m15_state.get("bos_level"),
+            "macro_high": m15_state.get("macro_high"),
+            "macro_low": m15_state.get("macro_low"),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "m15_candle_count": int(len(df_m15)) if df_m15 is not None else 0
         },
         "generated_at": datetime.now(timezone.utc).isoformat()
     }
