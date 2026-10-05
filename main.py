@@ -1,5 +1,8 @@
 import os
 import asyncio
+import io
+import struct
+import zlib
 import time
 import json
 import logging
@@ -1722,29 +1725,44 @@ def handle_telegram_callback(
             timeframe = parts[3]
             if symbol not in SYMBOLS or timeframe not in {"15m", "5m", "1m"}:
                 return
-            chart_url = build_owner_chart_url(symbol, timeframe, chat_id)
-            if not chart_url:
-                text = (
-                    "⚠️ *Graphique indisponible*\n\n"
-                    "Configurez `PUBLIC_BASE_URL` avec l'URL publique de NOVA. "
-                    "Aucune autre configuration du bot n'est nécessaire."
-                )
-                if message_id is not None:
-                    telegram_edit_message(chat_id, message_id, text, reply_markup=telegram_menu_keyboard())
-                return
-            text = (
-                f"📈 *Graphique NOVA — {symbol} {timeframe.upper()}*\n\n"
-                "Le graphique utilise les données du bot et affiche ses zones M15/SMC détectées.\n\n"
-                "Ouvrez le graphique interactif :"
-            )
-            url_keyboard = {
-                "inline_keyboard": [
-                    [{"text": "📊 Ouvrir le graphique", "url": chart_url}],
-                    [{"text": "⬅️ Retour aux paires", "callback_data": "market_charts"}]
-                ]
-            }
             if message_id is not None:
-                telegram_edit_message(chat_id, message_id, text, reply_markup=url_keyboard)
+                telegram_edit_message(
+                    chat_id,
+                    message_id,
+                    (
+                        f"⏳ Génération du graphique *{symbol} "
+                        f"{timeframe.upper()}*...\n\n"
+                        "Données marché + zones SMC détectées par NOVA."
+                    ),
+                    reply_markup=telegram_menu_keyboard()
+                )
+
+            chart_png = _build_owner_chart_png(symbol, timeframe)
+
+            if not chart_png:
+                send_telegram_owner_message(
+                    (
+                        f"⚠️ *Graphique indisponible — {symbol} "
+                        f"{timeframe.upper()}*\n\n"
+                        "NOVA n'a pas obtenu de données de marché exploitables "
+                        "pour ce graphique."
+                    ),
+                    reply_markup=telegram_menu_keyboard()
+                )
+                return
+
+            caption = (
+                f"📈 *NOVA — {symbol} {timeframe.upper()}*\n"
+                f"Bias M15 : {(_owner_chart_data(symbol, '15m') or {}).get('overlays', {}).get('bias') or 'N/A'}\n"
+                "Graphique généré directement par NOVA.\n"
+                "Les zones affichées correspondent aux éléments SMC détectés."
+            )
+
+            if not send_telegram_owner_photo(chart_png, caption):
+                send_telegram_owner_message(
+                    "⚠️ Impossible d'envoyer le graphique directement sur Telegram.",
+                    reply_markup=telegram_menu_keyboard()
+                )
             return
 
         elif data == "watched_pairs":
@@ -4590,6 +4608,275 @@ def build_owner_chart_url(symbol, timeframe, owner_id):
         return None
     token = _owner_chart_token(symbol, timeframe)
     return f"{base}/owner/chart?symbol={symbol.upper()}&timeframe={timeframe}&token={token}"
+
+
+
+def _png_chunk(chunk_type, data):
+    return (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xffffffff)
+    )
+
+
+def _build_owner_chart_png(symbol, timeframe):
+    """
+    Génère directement en mémoire un PNG du marché.
+    Aucun serveur web, URL publique ou navigateur n'est nécessaire.
+    """
+    chart = _owner_chart_data(symbol, timeframe)
+    if not chart or not chart.get("candles"):
+        return None
+
+    candles = chart["candles"][-180:]
+    overlays = chart.get("overlays", {})
+
+    width, height = 1400, 820
+    left, right, top, bottom = 70, 35, 55, 65
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+
+    values = []
+    for c in candles:
+        values.extend([c["high"], c["low"]])
+
+    for key in ("macro_high", "macro_low", "bos_level"):
+        value = overlays.get(key)
+        if value is not None:
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError):
+                pass
+
+    for collection in (
+        overlays.get("zones", []),
+        overlays.get("order_blocks", []),
+        overlays.get("fvgs", []),
+    ):
+        for zone in collection:
+            for key in ("zone_min", "zone_max", "low", "high", "lower", "upper"):
+                value = zone.get(key)
+                if value is not None:
+                    try:
+                        values.append(float(value))
+                    except (TypeError, ValueError):
+                        pass
+
+    if not values:
+        return None
+
+    price_min = min(values)
+    price_max = max(values)
+    span = max(price_max - price_min, abs(price_max) * 0.001, 1e-9)
+    pad = span * 0.08
+    price_min -= pad
+    price_max += pad
+
+    raw = bytearray(width * height * 3)
+
+    def fill(bg):
+        r, g, b = bg
+        for y in range(height):
+            row = y * width * 3
+            for x in range(width):
+                i = row + x * 3
+                raw[i:i + 3] = bytes((r, g, b))
+
+    fill((11, 14, 19))
+
+    def pixel(x, y, color):
+        if 0 <= x < width and 0 <= y < height:
+            i = (y * width + x) * 3
+            raw[i:i + 3] = bytes(color)
+
+    def rect(x1, y1, x2, y2, color):
+        x1, x2 = sorted((max(0, int(x1)), min(width - 1, int(x2))))
+        y1, y2 = sorted((max(0, int(y1)), min(height - 1, int(y2))))
+        if x2 < x1 or y2 < y1:
+            return
+        for y in range(y1, y2 + 1):
+            for x in range(x1, x2 + 1):
+                pixel(x, y, color)
+
+    def line(x1, y1, x2, y2, color, thickness=1):
+        x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+        dx = abs(x2 - x1)
+        dy = -abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx + dy
+        while True:
+            for ox in range(-thickness + 1, thickness):
+                for oy in range(-thickness + 1, thickness):
+                    pixel(x1 + ox, y1 + oy, color)
+            if x1 == x2 and y1 == y2:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x1 += sx
+            if e2 <= dx:
+                err += dx
+                y1 += sy
+
+    def py(value):
+        return top + int((price_max - float(value)) / (price_max - price_min) * plot_h)
+
+    def px(index):
+        if len(candles) <= 1:
+            return left + plot_w // 2
+        return left + int(index * plot_w / (len(candles) - 1))
+
+    # Grille
+    for n in range(1, 6):
+        y = top + int(n * plot_h / 6)
+        line(left, y, width - right, y, (31, 37, 47), 1)
+
+    for n in range(1, 10):
+        x = left + int(n * plot_w / 10)
+        line(x, top, x, height - bottom, (25, 30, 39), 1)
+
+    # Zones M15 / OB / FVG
+    def draw_zone(z, color):
+        lows = []
+        highs = []
+        for key in ("zone_min", "low", "lower"):
+            if z.get(key) is not None:
+                try:
+                    lows.append(float(z[key]))
+                except (TypeError, ValueError):
+                    pass
+        for key in ("zone_max", "high", "upper"):
+            if z.get(key) is not None:
+                try:
+                    highs.append(float(z[key]))
+                except (TypeError, ValueError):
+                    pass
+        if not lows or not highs:
+            return
+        y1, y2 = py(max(highs)), py(min(lows))
+        rect(left, y1, width - right, y2, color)
+
+    for z in overlays.get("zones", []):
+        draw_zone(
+            z,
+            (18, 55, 105) if str(z.get("level_type", "")).upper() == "SUPPORT"
+            else (105, 28, 38)
+        )
+
+    for z in overlays.get("order_blocks", []):
+        draw_zone(z, (78, 34, 110))
+
+    for z in overlays.get("fvgs", []):
+        draw_zone(z, (110, 88, 20))
+
+    # Prix clés
+    key_lines = (
+        ("macro_high", (239, 68, 68)),
+        ("macro_low", (59, 130, 246)),
+        ("bos_level", (245, 158, 11)),
+    )
+    for key, color in key_lines:
+        value = overlays.get(key)
+        if value is not None:
+            try:
+                y = py(float(value))
+                line(left, y, width - right, y, color, 2)
+            except (TypeError, ValueError):
+                pass
+
+    # Chandeliers
+    candle_w = max(2, int(plot_w / max(len(candles), 1) * 0.58))
+    for i, c in enumerate(candles):
+        x = px(i)
+        y_high = py(c["high"])
+        y_low = py(c["low"])
+        y_open = py(c["open"])
+        y_close = py(c["close"])
+        bullish = c["close"] >= c["open"]
+        color = (38, 166, 154) if bullish else (239, 83, 80)
+
+        line(x, y_high, x, y_low, color, 1)
+        rect(
+            x - candle_w // 2,
+            min(y_open, y_close),
+            x + candle_w // 2,
+            max(y_open, y_close),
+            color
+        )
+
+    # Cadre
+    line(left, top, width - right, top, (48, 54, 65))
+    line(left, height - bottom, width - right, height - bottom, (48, 54, 65))
+    line(left, top, left, height - bottom, (48, 54, 65))
+    line(width - right, top, width - right, height - bottom, (48, 54, 65))
+
+    # Encode PNG RGB sans dépendance externe.
+    rows = []
+    stride = width * 3
+    for y in range(height):
+        rows.append(b"\x00" + bytes(raw[y * stride:(y + 1) * stride]))
+    compressed = zlib.compress(b"".join(rows), 6)
+
+    png = bytearray(b"\x89PNG\r\n\x1a\n")
+    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += _png_chunk(b"IDAT", compressed)
+    png += _png_chunk(b"IEND", b"")
+    return bytes(png)
+
+
+def send_telegram_owner_photo(photo_bytes, caption):
+    """
+    Envoie une image directement au propriétaire.
+    Aucun lien public n'est utilisé.
+    """
+    if not telegram_owner_is_configured() or not photo_bytes:
+        return False
+
+    try:
+        response = requests.post(
+            telegram_api_url("sendPhoto"),
+            data={
+                "chat_id": TELEGRAM_OWNER_ID,
+                "caption": str(caption),
+            },
+            files={
+                "photo": (
+                    "nova_chart.png",
+                    io.BytesIO(photo_bytes),
+                    "image/png",
+                )
+            },
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            logging.error(
+                f"Erreur Telegram sendPhoto HTTP {response.status_code}: "
+                f"{response.text}"
+            )
+            return False
+
+        try:
+            data = response.json()
+        except ValueError:
+            logging.error(
+                f"Réponse Telegram sendPhoto invalide : {response.text}"
+            )
+            return False
+
+        if not data.get("ok", False):
+            logging.error(f"Telegram a refusé sendPhoto : {data}")
+            return False
+
+        return True
+
+    except Exception as e:
+        logging.exception(
+            f"Erreur envoi graphique Telegram : {e}"
+        )
+        return False
 
 
 def _owner_chart_data(symbol, timeframe):
