@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import requests
-from flask import Flask
+from flask import Flask, Response, request
 
 
 # ==========================================
@@ -498,6 +498,12 @@ def telegram_menu_keyboard():
             ],
             [
                 {
+                    "text": "📈 Graphiques marché",
+                    "callback_data": "market_charts"
+                }
+            ],
+            [
+                {
                     "text": "📈 Paires surveillées",
                     "callback_data": "watched_pairs"
                 }
@@ -600,7 +606,8 @@ def telegram_answer_callback(
 def telegram_edit_message(
     chat_id,
     message_id,
-    text
+    text,
+    reply_markup=None
 ):
     """
     Modifie un message Telegram.
@@ -613,7 +620,11 @@ def telegram_edit_message(
         "chat_id": TELEGRAM_OWNER_ID,
         "message_id": message_id,
         "text": str(text),
-        "reply_markup": telegram_menu_keyboard()
+        "reply_markup": (
+            reply_markup
+            if reply_markup is not None
+            else telegram_menu_keyboard()
+        )
     }
 
     try:
@@ -1659,6 +1670,82 @@ def handle_telegram_callback(
             text = (
                 get_active_signals_message()
             )
+
+        elif data == "market_charts":
+
+            text = "📈 *GRAPHIQUES NOVA*\n\nChoisissez la paire à visualiser :"
+            chart_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "₿ BTCUSD", "callback_data": "chart_pair_BTCUSD"},
+                        {"text": "🪙 XAUUSD", "callback_data": "chart_pair_XAUUSD"}
+                    ],
+                    [
+                        {"text": "💶 EURUSD", "callback_data": "chart_pair_EURUSD"},
+                        {"text": "💷 GBPUSD", "callback_data": "chart_pair_GBPUSD"}
+                    ],
+                    [
+                        {"text": "⬅️ Retour", "callback_data": "refresh"}
+                    ]
+                ]
+            }
+            if message_id is not None:
+                telegram_edit_message(chat_id, message_id, text, reply_markup=chart_keyboard)
+            return
+
+        elif data.startswith("chart_pair_"):
+
+            symbol = data.replace("chart_pair_", "", 1).upper()
+            if symbol not in SYMBOLS:
+                return
+            text = f"📈 *{symbol}*\n\nChoisissez le timeframe :"
+            tf_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "M15", "callback_data": f"chart_tf_{symbol}_15m"},
+                        {"text": "M5", "callback_data": f"chart_tf_{symbol}_5m"},
+                        {"text": "M1", "callback_data": f"chart_tf_{symbol}_1m"}
+                    ],
+                    [{"text": "⬅️ Retour", "callback_data": "market_charts"}]
+                ]
+            }
+            if message_id is not None:
+                telegram_edit_message(chat_id, message_id, text, reply_markup=tf_keyboard)
+            return
+
+        elif data.startswith("chart_tf_"):
+
+            parts = data.split("_")
+            if len(parts) != 4:
+                return
+            symbol = parts[2].upper()
+            timeframe = parts[3]
+            if symbol not in SYMBOLS or timeframe not in {"15m", "5m", "1m"}:
+                return
+            chart_url = build_owner_chart_url(symbol, timeframe, chat_id)
+            if not chart_url:
+                text = (
+                    "⚠️ *Graphique indisponible*\n\n"
+                    "Configurez `PUBLIC_BASE_URL` avec l'URL publique de NOVA. "
+                    "Aucune autre configuration du bot n'est nécessaire."
+                )
+                if message_id is not None:
+                    telegram_edit_message(chat_id, message_id, text, reply_markup=telegram_menu_keyboard())
+                return
+            text = (
+                f"📈 *Graphique NOVA — {symbol} {timeframe.upper()}*\n\n"
+                "Le graphique utilise les données du bot et affiche ses zones M15/SMC détectées.\n\n"
+                "Ouvrez le graphique interactif :"
+            )
+            url_keyboard = {
+                "inline_keyboard": [
+                    [{"text": "📊 Ouvrir le graphique", "url": chart_url}],
+                    [{"text": "⬅️ Retour aux paires", "callback_data": "market_charts"}]
+                ]
+            }
+            if message_id is not None:
+                telegram_edit_message(chat_id, message_id, text, reply_markup=url_keyboard)
+            return
 
         elif data == "watched_pairs":
 
@@ -4430,6 +4517,156 @@ def start_trading_threads():
             "Threads de trading et "
             "Telegram démarrés."
         )
+
+
+# ==========================================
+# VISUALISATION GRAPHIQUE PROPRIETAIRE
+# ==========================================
+
+OWNER_CHART_TOKEN_SECRET = os.environ.get(
+    "OWNER_CHART_TOKEN_SECRET",
+    TELEGRAM_TOKEN or TELEGRAM_OWNER_ID
+).strip()
+
+
+def _owner_chart_token(symbol, timeframe):
+    import hashlib
+    payload = f"{symbol.upper()}:{timeframe}:{OWNER_CHART_TOKEN_SECRET}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _owner_chart_authorized(symbol, timeframe, token):
+    if not telegram_owner_is_configured():
+        return False
+    return bool(token) and token == _owner_chart_token(symbol, timeframe)
+
+
+def _owner_chart_public_base_url():
+    base = (os.environ.get("PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+    if base:
+        return base
+    railway_domain = (os.environ.get("RAILWAY_PUBLIC_DOMAIN", "") or "").strip()
+    if railway_domain:
+        return railway_domain if railway_domain.startswith("http") else f"https://{railway_domain}"
+    render_url = (os.environ.get("RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
+    if render_url:
+        return render_url
+    return ""
+
+
+def build_owner_chart_url(symbol, timeframe, owner_id):
+    if not is_telegram_owner(owner_id):
+        return None
+    base = _owner_chart_public_base_url()
+    if not base:
+        return None
+    token = _owner_chart_token(symbol, timeframe)
+    return f"{base}/owner/chart?symbol={symbol.upper()}&timeframe={timeframe}&token={token}"
+
+
+def _owner_chart_data(symbol, timeframe):
+    df = fetch_market_data_safe(symbol, timeframe, limit=300)
+    if df is None or df.empty:
+        return None
+
+    candles = []
+    for ts, row in df.tail(300).iterrows():
+        try:
+            epoch = int(pd.Timestamp(ts).timestamp())
+            candles.append({
+                "time": epoch,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"])
+            })
+        except Exception:
+            continue
+
+    with M15_ZONE_LOCK:
+        state = dict(M15_ZONE_STATE.get(symbol, {}))
+        zones = [dict(x) for x in M15_ZONES.get(symbol, [])]
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candles": candles,
+        "overlays": {
+            "zones": zones,
+            "order_blocks": [dict(x) for x in state.get("order_blocks", [])],
+            "fvgs": [dict(x) for x in state.get("fvgs", [])],
+            "bias": state.get("bias"),
+            "bos": state.get("bos"),
+            "bos_level": state.get("bos_level"),
+            "macro_high": state.get("macro_high"),
+            "macro_low": state.get("macro_low"),
+            "updated_at": state.get("updated_at")
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+
+OWNER_CHART_HTML = """<!doctype html>
+<html lang=\"fr\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no\">
+<title>NOVA — Graphique marché</title>
+<script src=\"https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js\"></script>
+<style>
+html,body{margin:0;width:100%;height:100%;background:#0b0e13;color:#d8dee9;font-family:Inter,Arial,sans-serif;overflow:hidden}
+#top{height:54px;display:flex;align-items:center;gap:10px;padding:0 14px;background:#11151c;border-bottom:1px solid #252b35;box-sizing:border-box}
+#title{font-weight:700;font-size:16px;margin-right:auto}.badge{font-size:12px;padding:5px 8px;border:1px solid #343b48;border-radius:6px;background:#171c24}.bias{font-weight:700}
+#chart{position:absolute;left:0;right:0;top:54px;bottom:0}.legend{position:absolute;z-index:10;top:66px;left:12px;background:rgba(13,17,23,.88);border:1px solid #2a303a;border-radius:7px;padding:8px 10px;font-size:11px;line-height:1.65;pointer-events:none}.sw{display:inline-block;width:9px;height:9px;margin-right:5px;border-radius:2px}
+</style>
+</head>
+<body>
+<div id=\"top\"><div id=\"title\">NOVA — Graphique</div><div class=\"badge\" id=\"tf\"></div><div class=\"badge bias\" id=\"bias\"></div></div>
+<div class=\"legend\"><span><i class=\"sw\" style=\"background:#3b82f6\"></i>Support</span> &nbsp; <span><i class=\"sw\" style=\"background:#ef4444\"></i>Résistance</span><br><span><i class=\"sw\" style=\"background:#a855f7\"></i>Order Block</span> &nbsp; <span><i class=\"sw\" style=\"background:#eab308\"></i>FVG</span></div>
+<div id=\"chart\"></div>
+<script>
+const payload = __PAYLOAD__;
+const root=document.getElementById('chart');
+const chart=LightweightCharts.createChart(root,{layout:{background:{color:'#0b0e13'},textColor:'#b8c0cc'},grid:{vertLines:{color:'#171c24'},horzLines:{color:'#171c24'}},crosshair:{mode:LightweightCharts.CrosshairMode.Normal},rightPriceScale:{borderColor:'#303641'},timeScale:{borderColor:'#303641',timeVisible:true,secondsVisible:false},handleScroll:{mouseWheel:true,pressedMouseMove:true},handleScale:{mouseWheel:true,pinch:true,axisPressedMouseMove:true}});
+const candles=chart.addCandlestickSeries({upColor:'#26a69a',downColor:'#ef5350',borderUpColor:'#26a69a',borderDownColor:'#ef5350',wickUpColor:'#26a69a',wickDownColor:'#ef5350'});
+candles.setData(payload.candles);
+function line(price,color,title){if(price===null||price===undefined)return;const s=chart.addLineSeries({color,lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,lastValueVisible:true,priceLineVisible:false,title});s.setData(payload.candles.map(c=>({time:c.time,value:price})));}
+const o=payload.overlays||{};
+line(o.macro_high,'#ef4444','M15 High');line(o.macro_low,'#3b82f6','M15 Low');line(o.bos_level,'#f59e0b','BOS');
+const zoneLayer=document.createElement('div');zoneLayer.style.cssText='position:absolute;inset:0;pointer-events:none;z-index:5;';root.appendChild(zoneLayer);
+const zoneDefs=[];
+function zone(z,color,title){if(!z||z.zone_min===undefined||z.zone_max===undefined)return;zoneDefs.push({min:Number(z.zone_min),max:Number(z.zone_max),color,title});}
+(o.zones||[]).forEach(z=>zone(z,z.level_type==='SUPPORT'?'rgba(59,130,246,.16)':'rgba(239,68,68,.16)',z.level_type));
+(o.order_blocks||[]).forEach(z=>zone({zone_min:z.low,zone_max:z.high},'rgba(168,85,247,.18)',z.type));
+(o.fvgs||[]).forEach(z=>zone({zone_min:z.lower,zone_max:z.upper},'rgba(234,179,8,.16)',z.type));
+function drawZones(){zoneLayer.innerHTML='';zoneDefs.forEach(z=>{const a=candles.priceToCoordinate(z.max),b=candles.priceToCoordinate(z.min);if(a===null||b===null)return;const el=document.createElement('div');el.style.cssText=`position:absolute;left:0;right:0;top:${Math.min(a,b)}px;height:${Math.max(1,Math.abs(b-a))}px;background:${z.color};border-top:1px solid ${z.color.replace('.16', '.55').replace('.18','.55')};border-bottom:1px solid ${z.color.replace('.16', '.55').replace('.18','.55')};`;el.title=z.title;zoneLayer.appendChild(el);});}
+chart.timeScale().subscribeVisibleTimeRangeChange(drawZones);
+document.getElementById('title').textContent=`NOVA — ${payload.symbol}`;document.getElementById('tf').textContent=payload.timeframe.toUpperCase();document.getElementById('bias').textContent=o.bias?`Biais ${o.bias}`:'';
+window.addEventListener('resize',()=>{chart.applyOptions({width:root.clientWidth,height:root.clientHeight});drawZones();});
+chart.timeScale().fitContent();drawZones();
+</script>
+</body>
+</html>"""
+
+
+@app.route("/owner/chart")
+def owner_chart():
+    symbol = (request.args.get("symbol", "") or "").upper().strip()
+    timeframe = (request.args.get("timeframe", "") or "").lower().strip()
+    token = (request.args.get("token", "") or "").strip()
+
+    if symbol not in SYMBOLS or timeframe not in {"1m", "5m", "15m"}:
+        return "Accès graphique invalide.", 400
+    if not _owner_chart_authorized(symbol, timeframe, token):
+        return "Accès propriétaire refusé.", 403
+
+    data = _owner_chart_data(symbol, timeframe)
+    if data is None:
+        return "Données de marché indisponibles pour ce graphique.", 503
+
+    import json as _json
+    html = OWNER_CHART_HTML.replace("__PAYLOAD__", _json.dumps(data, separators=(",", ":")))
+    return Response(html, mimetype="text/html")
 
 
 # ==========================================
