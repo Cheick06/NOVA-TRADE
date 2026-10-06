@@ -18,7 +18,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Nettoyage des variables Telegram
 TELEGRAM_TOKEN = os.environ.get(
     "TELEGRAM_TOKEN",
     ""
@@ -34,7 +33,6 @@ TELEGRAM_OWNER_ID = os.environ.get(
     "5459538739"
 ).strip()
 
-# Les 4 actifs surveillés
 SYMBOLS = [
     "BTCUSD",
     "XAUUSD",
@@ -42,21 +40,13 @@ SYMBOLS = [
     "GBPUSD"
 ]
 
-# Fichiers de persistance locale
 TRADES_FILE = "active_trades.json"
 SIGNALS_FILE = "processed_signals.json"
 TRADE_HISTORY_FILE = "trade_history.json"
 WEEKLY_REPORTS_FILE = "weekly_reports.json"
-
-# Opportunités M15 en attente de surveillance M5/M1
 OPPORTUNITIES_FILE = "pending_opportunities.json"
 
-# API BiQuote
 BIQUOTE_BASE_URL = "https://biquote.io/api"
-
-# ==========================================
-# ÉTAT DES THREADS
-# ==========================================
 
 _threads_started = False
 _threads_lock = threading.Lock()
@@ -66,15 +56,6 @@ _threads_lock = threading.Lock()
 # ==========================================
 
 def telegram_configuration_diagnostic():
-    """
-    Diagnostic sécurisé de la configuration Telegram.
-
-    IMPORTANT :
-    - Le token complet n'est jamais affiché.
-    - Aucun secret Telegram n'est écrit dans les logs.
-    - Ce diagnostic sert uniquement à vérifier ce que
-      l'application reçoit depuis les variables d'environnement.
-    """
 
     token_present = bool(TELEGRAM_TOKEN)
     channel_id_present = bool(TELEGRAM_CHANNEL_ID)
@@ -193,12 +174,6 @@ def telegram_api_url(method):
     )
 
 def telegram_validate_and_prepare():
-    """
-    Vérifie le token Telegram et prépare le polling.
-
-    getUpdates ne doit pas être utilisé avec un webhook actif.
-    Le webhook est donc supprimé avant le démarrage du polling.
-    """
 
     telegram_configuration_diagnostic()
 
@@ -309,7 +284,6 @@ def send_telegram_message(
     message,
     reply_markup=None
 ):
-    """Envoie un message de trading uniquement au canal/groupe Telegram."""
 
     if not telegram_is_configured():
         logging.warning(
@@ -367,7 +341,6 @@ def send_telegram_owner_message(
     message,
     reply_markup=None
 ):
-    """Envoie un message uniquement à l'interface personnelle du propriétaire."""
 
     if not telegram_owner_is_configured():
         logging.warning("Interface propriétaire Telegram non configurée : TELEGRAM_TOKEN manquant.")
@@ -417,20 +390,15 @@ def send_telegram_owner_message(
     return False
 
 def telegram_owner_id():
-    """Retourne l'identifiant Telegram fixe du propriétaire."""
     return str(TELEGRAM_OWNER_ID).strip()
 
 def is_telegram_owner(chat_id):
-    """Vérifie que l'utilisateur est le propriétaire."""
     return (
         telegram_owner_is_configured()
         and str(chat_id).strip() == telegram_owner_id()
     )
 
 def telegram_menu_keyboard():
-    """
-    Menu Telegram réservé au propriétaire.
-    """
 
     return {
         "inline_keyboard": [
@@ -468,9 +436,6 @@ def telegram_menu_keyboard():
     }
 
 def send_telegram_menu():
-    """
-    Affiche le menu propriétaire.
-    """
 
     message = (
         "🤖 *NOVA TRADE*\n\n"
@@ -486,9 +451,6 @@ def send_telegram_menu():
 def telegram_answer_callback(
     callback_query_id
 ):
-    """
-    Accuse réception d'un clic Telegram.
-    """
 
     if not TELEGRAM_TOKEN:
         return False
@@ -537,9 +499,6 @@ def telegram_edit_message(
     message_id,
     text
 ):
-    """
-    Modifie un message Telegram.
-    """
 
     if not telegram_owner_is_configured():
         return False
@@ -598,9 +557,6 @@ def telegram_edit_message(
 # ==========================================
 
 def get_active_signals_message():
-    """
-    Affiche les signaux actuellement suivis.
-    """
 
     active_trades = load_json(
         TRADES_FILE
@@ -702,9 +658,6 @@ def get_active_signals_message():
     return "\n".join(lines)
 
 def get_watched_pairs_message():
-    """
-    Affiche les quatre actifs.
-    """
 
     lines = [
         "📈 *PAIRES SURVEILLÉES*",
@@ -731,9 +684,6 @@ def get_watched_pairs_message():
     return "\n".join(lines)
 
 def get_bot_status_message():
-    """
-    Affiche l'état du bot.
-    """
 
     active_trades = load_json(
         TRADES_FILE
@@ -778,22 +728,141 @@ def get_bot_status_message():
 # ==========================================
 
 def utc_now_iso():
-    """
-    Retourne l'heure UTC actuelle au format ISO.
-    """
-
     return datetime.utcnow().isoformat()
+
+def get_pip_size(symbol):
+
+    if symbol in [
+        "EURUSD",
+        "GBPUSD"
+    ]:
+        return 0.0001
+
+    if symbol == "XAUUSD":
+        return 0.01
+
+    if symbol == "BTCUSD":
+        return 1.0
+
+    return 0.0001
+
+def get_price_decimals(symbol):
+
+    if symbol in [
+        "EURUSD",
+        "GBPUSD"
+    ]:
+        return 5
+
+    if symbol == "XAUUSD":
+        return 2
+
+    if symbol == "BTCUSD":
+        return 2
+
+    return 5
+
+def format_price(
+    symbol,
+    price
+):
+
+    return (
+        f"{float(price):."
+        f"{get_price_decimals(symbol)}f}"
+    )
+
+def price_to_pips(
+    symbol,
+    distance
+):
+
+    return (
+        abs(float(distance))
+        / get_pip_size(symbol)
+    )
+
+def format_pips(
+    symbol,
+    distance
+):
+
+    pips = price_to_pips(
+        symbol,
+        distance
+    )
+
+    if abs(pips - round(pips)) < 0.000001:
+        return f"{int(round(pips))}"
+
+    return f"{pips:.1f}"
+
+def generate_signal_id():
+
+    now = datetime.utcnow()
+
+    date_prefix = now.strftime(
+        "%y%m%d"
+    )
+
+    history = load_json(
+        TRADE_HISTORY_FILE
+    )
+
+    active = load_json(
+        TRADES_FILE
+    )
+
+    used = []
+
+    for trades in [
+        history,
+        active
+    ]:
+
+        for trade in trades.values():
+
+            signal_id = trade.get(
+                "signal_id",
+                ""
+            )
+
+            if signal_id.startswith(
+                f"NOVA-{date_prefix}-"
+            ):
+
+                try:
+
+                    used.append(
+                        int(
+                            signal_id.rsplit(
+                                "-",
+                                1
+                            )[1]
+                        )
+                    )
+
+                except (
+                    ValueError,
+                    IndexError
+                ):
+
+                    pass
+
+    sequence = (
+        max(used, default=0)
+        + 1
+    )
+
+    return (
+        f"NOVA-{date_prefix}-"
+        f"{sequence:03d}"
+    )
 
 def ensure_trade_history_record(
     trade_id,
     trade
 ):
-    """
-    Enregistre un nouveau signal dans l'historique.
-
-    L'historique est conservé même lorsque le trade
-    est ensuite retiré de active_trades.json.
-    """
 
     history = load_json(
         TRADE_HISTORY_FILE
@@ -804,6 +873,9 @@ def ensure_trade_history_record(
 
     history[trade_id] = {
         "trade_id": trade_id,
+        "signal_id": trade.get(
+            "signal_id"
+        ),
         "symbol": trade.get(
             "symbol",
             "INCONNU"
@@ -844,6 +916,9 @@ def ensure_trade_history_record(
             "created_at",
             utc_now_iso()
         ),
+        "signal_sent_at": trade.get(
+            "signal_sent_at"
+        ),
         "status": "ACTIVE",
         "result": None,
         "closed_at": None,
@@ -861,9 +936,6 @@ def record_trade_event(
     event,
     price=None
 ):
-    """
-    Enregistre un événement du cycle de vie du signal.
-    """
 
     history = load_json(
         TRADE_HISTORY_FILE
@@ -899,9 +971,6 @@ def close_trade_in_history(
     result,
     close_price
 ):
-    """
-    Enregistre définitivement le résultat d'un trade.
-    """
 
     history = load_json(
         TRADE_HISTORY_FILE
@@ -939,15 +1008,6 @@ def get_statistics(
     start_datetime=None,
     end_datetime=None
 ):
-    """
-    Calcule les statistiques sur l'historique.
-
-    Les signaux générés sont comptés selon leur date
-    de création.
-
-    Les résultats TP/SL sont comptés selon leur date
-    de clôture.
-    """
 
     history = load_json(
         TRADE_HISTORY_FILE
@@ -1248,9 +1308,6 @@ def format_statistics_message(
     statistics,
     title="📊 STATISTIQUES NOVA TRADE"
 ):
-    """
-    Formate les statistiques pour Telegram.
-    """
 
     total_closed = (
         statistics["closed_tp3"]
@@ -1321,10 +1378,6 @@ def format_statistics_message(
     return "\n".join(lines)
 
 def get_all_time_statistics_message():
-    """
-    Retourne les statistiques depuis le début
-    de l'historique.
-    """
 
     statistics = get_statistics()
 
@@ -1334,16 +1387,6 @@ def get_all_time_statistics_message():
     )
 
 def generate_weekly_report():
-    """
-    Génère et envoie le rapport de fin de semaine.
-
-    Le rapport est exécuté le samedi à 00:00 UTC,
-    correspondant à la fin de la semaine de trading
-    vendredi 23:59.
-
-    Période :
-    lundi 00:00 -> samedi 00:00.
-    """
 
     now = datetime.utcnow()
 
@@ -1437,9 +1480,6 @@ def generate_weekly_report():
 def handle_telegram_callback(
     callback_query
 ):
-    """
-    Traite uniquement les boutons du propriétaire.
-    """
 
     try:
 
@@ -1540,9 +1580,6 @@ def handle_telegram_callback(
         )
 
 def telegram_polling_loop():
-    """
-    Écoute les commandes et boutons Telegram.
-    """
 
     telegram_configuration_diagnostic()
 
@@ -1774,9 +1811,6 @@ def fetch_biquote_ohlcv(
     timeframe="15m",
     count=100
 ):
-    """
-    Récupère les bougies OHLC depuis BiQuote.
-    """
 
     url = (
         f"{BIQUOTE_BASE_URL}/"
@@ -1936,9 +1970,6 @@ def fetch_biquote_ohlcv(
 def fetch_biquote_live_price(
     symbol
 ):
-    """
-    Récupère le prix mid actuel.
-    """
 
     url = (
         f"{BIQUOTE_BASE_URL}/"
@@ -2233,14 +2264,6 @@ def get_h1_zones(
 def calculate_indicators(
     df
 ):
-    """
-    Calcule :
-    - EMA20
-    - EMA50
-    - RSI14
-    - ATR14
-    - ADX14
-    """
 
     if (
         df.empty
@@ -2464,13 +2487,6 @@ def calculate_indicators(
 def evaluate_market_filter(
     df
 ):
-    """
-    Filtre souple.
-
-    Les indicateurs ne sont pas des veto individuels.
-    Le contexte doit simplement atteindre un minimum
-    de cohérence avant qu'un signal soit créé.
-    """
 
     if (
         df.empty
@@ -2627,13 +2643,6 @@ def create_pending_opportunity(
     zone,
     candle_id
 ):
-    """
-    Enregistre l'opportunité M15 pour qu'elle soit
-    ensuite surveillée par M5.
-
-    Cette étape remplace uniquement la création
-    immédiate du trade qui existait auparavant.
-    """
 
     opportunities = load_json(
         OPPORTUNITIES_FILE
@@ -2778,10 +2787,6 @@ def scan_market_m15(
 
             return
 
-        # ======================================
-        # BUY
-        # ======================================
-
         if pattern in [
             "AVALEMENT_HAUSSIER",
             "MARTEAU"
@@ -2917,10 +2922,6 @@ def scan_market_m15(
                     )
 
                     break
-
-        # ======================================
-        # SELL
-        # ======================================
 
         elif pattern in [
             "AVALEMENT_BAISSIER",
@@ -3072,16 +3073,6 @@ def scan_market_m15(
 def evaluate_m5_opportunity(
     opportunity
 ):
-    """
-    Surveille une opportunité M15 avec M5.
-
-    M5 ne recalcule pas la stratégie M15 :
-    il sert uniquement à surveiller le moment où
-    l'opportunité devient exploitable.
-
-    Une bougie M5 clôturée dans le même sens que
-    l'opportunité constitue la confirmation M5.
-    """
 
     symbol = opportunity.get(
         "symbol"
@@ -3136,10 +3127,6 @@ def evaluate_m5_opportunity(
         last_m5["low"]
     )
 
-    # ======================================
-    # INVALIDATION PAR LE SL
-    # ======================================
-
     if direction == "BUY":
 
         if m5_low <= initial_sl:
@@ -3186,10 +3173,6 @@ def evaluate_m5_opportunity(
             "ETOILE_FILANTE"
         ]
 
-    # ======================================
-    # M5 CONFIRMÉ
-    # ======================================
-
     confirmation = {
         "m5_pattern": m5_pattern,
         "m5_open": m5_open,
@@ -3209,17 +3192,6 @@ def evaluate_m1_if_necessary(
     opportunity,
     m5_confirmation
 ):
-    """
-    M1 est utilisé uniquement lorsque le mouvement
-    M5 est déjà confirmé mais que le prix s'est éloigné
-    de manière importante du prix de référence M15.
-
-    Si le M5 est proche de l'entrée, M1 n'est pas
-    nécessaire.
-
-    Lorsque M1 est utilisé, une confirmation dans le
-    même sens permet de finaliser le signal.
-    """
 
     symbol = opportunity.get(
         "symbol"
@@ -3272,8 +3244,6 @@ def evaluate_m1_if_necessary(
         - entry
     )
 
-    # M1 n'est nécessaire que si le prix s'est
-    # éloigné de plus de 0.25 ATR M5.
     m1_needed = (
         distance
         > (
@@ -3349,13 +3319,6 @@ def finalize_pending_opportunity(
     candidate_id,
     opportunity
 ):
-    """
-    Transforme une opportunité M15 confirmée par M5/M1
-    en trade actif.
-
-    Les valeurs Entry / SL / TP sont reprises
-    exactement de l'opportunité M15.
-    """
 
     opportunities = load_json(
         OPPORTUNITIES_FILE
@@ -3426,6 +3389,10 @@ def finalize_pending_opportunity(
         f"{int(time.time())}"
     )
 
+    signal_id = generate_signal_id()
+
+    signal_sent_at = utc_now_iso()
+
     active_trades[
         trade_id
     ] = {
@@ -3454,6 +3421,10 @@ def finalize_pending_opportunity(
 
         "indicators": indicators,
 
+        "signal_id": signal_id,
+
+        "signal_sent_at": signal_sent_at,
+
         "created_at": (
             datetime.utcnow()
             .isoformat()
@@ -3472,65 +3443,44 @@ def finalize_pending_opportunity(
         ]
     )
 
-    if direction == "BUY":
+    direction_label = (
+        "ACHAT"
+        if direction == "BUY"
+        else
+        "VENTE"
+    )
 
-        send_telegram_message(
-            f"🟢 *SIGNAL ACHAT (BUY) "
-            f"via BIQUOTE*\n"
-            f"Actif: {symbol}\n"
-            f"Motif: {pattern}\n"
-            f"Confirmation: M15 → M5"
-            f" → M1 si nécessaire\n"
-            f"Filtre: "
-            f"{filter_score}/4\n"
-            f"EMA20/50: "
-            f"{indicators.get('ema20', 0):.5f} / "
-            f"{indicators.get('ema50', 0):.5f}\n"
-            f"RSI14: "
-            f"{indicators.get('rsi14', 0):.2f}\n"
-            f"ATR14: "
-            f"{indicators.get('atr14', 0):.5f}\n"
-            f"ADX14: "
-            f"{indicators.get('adx14', 0):.2f}\n"
-            f"Entrée: {entry:.2f}\n"
-            f"SL Initial: {sl:.2f}\n"
-            f"TP1: "
-            f"{tp1:.2f}\n"
-            f"TP2: "
-            f"{tp2:.2f}\n"
-            f"TP3: "
-            f"{tp3:.2f}"
-        )
+    direction_emoji = (
+        "🟢"
+        if direction == "BUY"
+        else
+        "🔴"
+    )
 
-    else:
+    send_time = datetime.fromisoformat(
+        signal_sent_at
+    ).strftime(
+        "%H:%M:%S"
+    )
 
-        send_telegram_message(
-            f"🔴 *SIGNAL VENTE "
-            f"(SHORT) via BIQUOTE*\n"
-            f"Actif: {symbol}\n"
-            f"Motif: {pattern}\n"
-            f"Confirmation: M15 → M5"
-            f" → M1 si nécessaire\n"
-            f"Filtre: "
-            f"{filter_score}/4\n"
-            f"EMA20/50: "
-            f"{indicators.get('ema20', 0):.5f} / "
-            f"{indicators.get('ema50', 0):.5f}\n"
-            f"RSI14: "
-            f"{indicators.get('rsi14', 0):.2f}\n"
-            f"ATR14: "
-            f"{indicators.get('atr14', 0):.5f}\n"
-            f"ADX14: "
-            f"{indicators.get('adx14', 0):.2f}\n"
-            f"Entrée: {entry:.2f}\n"
-            f"SL Initial: {sl:.2f}\n"
-            f"TP1: "
-            f"{tp1:.2f}\n"
-            f"TP2: "
-            f"{tp2:.2f}\n"
-            f"TP3: "
-            f"{tp3:.2f}"
-        )
+    message = (
+        f"{direction_emoji} *{direction_label} — {symbol}*\n"
+        f"🆔 Signal : {signal_id}\n"
+        f"🕐 Envoi : {send_time} UTC\n\n"
+        f"📍 Entrée : {format_price(symbol, entry)}\n"
+        f"🛑 SL : {format_price(symbol, sl)} — "
+        f"{format_pips(symbol, abs(entry - sl))} pips\n\n"
+        f"🎯 TP1 : {format_price(symbol, tp1)} — "
+        f"{format_pips(symbol, abs(tp1 - entry))} pips\n"
+        f"🎯 TP2 : {format_price(symbol, tp2)} — "
+        f"{format_pips(symbol, abs(tp2 - entry))} pips\n"
+        f"🎯 TP3 : {format_price(symbol, tp3)} — "
+        f"{format_pips(symbol, abs(tp3 - entry))} pips"
+    )
+
+    send_telegram_message(
+        message
+    )
 
     opportunities.pop(
         candidate_id,
@@ -3554,18 +3504,6 @@ def finalize_pending_opportunity(
 # ==========================================
 
 def scan_pending_opportunities_m5():
-    """
-    Parcourt les opportunités détectées par M15.
-
-    Flux :
-        M15 → opportunité
-             ↓
-        M5 surveillance
-             ↓
-        M1 si nécessaire
-             ↓
-        signal final
-    """
 
     opportunities = load_json(
         OPPORTUNITIES_FILE
@@ -3620,10 +3558,6 @@ def scan_pending_opportunities_m5():
 
                 continue
 
-            # ==================================
-            # M5 CONFIRMÉ
-            # ==================================
-
             opportunity[
                 "status"
             ] = "M5_CONFIRMED"
@@ -3657,10 +3591,6 @@ def scan_pending_opportunities_m5():
                     )
 
                 continue
-
-            # ==================================
-            # SIGNAL FINAL
-            # ==================================
 
             finalize_pending_opportunity(
                 candidate_id,
@@ -3792,6 +3722,15 @@ def track_active_trades():
                         "ACTIVE"
                     )
 
+                    signal_id = trade.get(
+                        "signal_id",
+                        t_id
+                    )
+
+                    event_time = datetime.utcnow().strftime(
+                        "%H:%M:%S"
+                    )
+
                     if direction == "BUY":
 
                         if current_price <= current_sl:
@@ -3799,7 +3738,9 @@ def track_active_trades():
                             send_telegram_message(
                                 f"❌ *SL Touché* sur "
                                 f"{symbol} "
-                                f"à {current_price:.2f}.\n"
+                                f"à {format_price(symbol, current_price)}.\n"
+                                f"🆔 Signal : {signal_id}\n"
+                                f"🕐 Événement : {event_time} UTC\n"
                                 f"Trade clos."
                             )
 
@@ -3841,7 +3782,9 @@ def track_active_trades():
                             send_telegram_message(
                                 f"🎯 *TP1 Atteint* "
                                 f"sur {symbol} "
-                                f"({tp1:.2f}) !\n"
+                                f"({format_price(symbol, tp1)}) !\n"
+                                f"🆔 Signal : {signal_id}\n"
+                                f"🕐 Événement : {event_time} UTC\n"
                                 f"🛡️ SL déplacé au "
                                 f"Break-Even."
                             )
@@ -3868,7 +3811,9 @@ def track_active_trades():
                             send_telegram_message(
                                 f"🎯🎯 *TP2 Atteint* "
                                 f"sur {symbol} "
-                                f"({tp2:.2f}) !\n"
+                                f"({format_price(symbol, tp2)}) !\n"
+                                f"🆔 Signal : {signal_id}\n"
+                                f"🕐 Événement : {event_time} UTC\n"
                                 f"🔒 SL déplacé au "
                                 f"niveau du TP1."
                             )
@@ -3890,7 +3835,9 @@ def track_active_trades():
                             send_telegram_message(
                                 f"🏆 *TP3 Atteint* "
                                 f"sur {symbol} "
-                                f"({tp3:.2f}).\n"
+                                f"({format_price(symbol, tp3)}).\n"
+                                f"🆔 Signal : {signal_id}\n"
+                                f"🕐 Événement : {event_time} UTC\n"
                                 f"Trade terminé."
                             )
 
@@ -3906,7 +3853,9 @@ def track_active_trades():
                                 f"❌ *SL Touché* "
                                 f"(Short) sur "
                                 f"{symbol} "
-                                f"à {current_price:.2f}.\n"
+                                f"à {format_price(symbol, current_price)}.\n"
+                                f"🆔 Signal : {signal_id}\n"
+                                f"🕐 Événement : {event_time} UTC\n"
                                 f"Trade clos."
                             )
 
@@ -3949,7 +3898,9 @@ def track_active_trades():
                                 f"🎯 *TP1 Atteint* "
                                 f"(Short) sur "
                                 f"{symbol} "
-                                f"({tp1:.2f}) !\n"
+                                f"({format_price(symbol, tp1)}) !\n"
+                                f"🆔 Signal : {signal_id}\n"
+                                f"🕐 Événement : {event_time} UTC\n"
                                 f"🛡️ SL déplacé au "
                                 f"Break-Even."
                             )
@@ -3977,7 +3928,9 @@ def track_active_trades():
                                 f"🎯🎯 *TP2 Atteint* "
                                 f"(Short) sur "
                                 f"{symbol} "
-                                f"({tp2:.2f}) !\n"
+                                f"({format_price(symbol, tp2)}) !\n"
+                                f"🆔 Signal : {signal_id}\n"
+                                f"🕐 Événement : {event_time} UTC\n"
                                 f"🔒 SL déplacé au "
                                 f"niveau du TP1."
                             )
@@ -3999,7 +3952,9 @@ def track_active_trades():
                             send_telegram_message(
                                 f"🏆 *TP3 Atteint* "
                                 f"sur {symbol} "
-                                f"({tp3:.2f}).\n"
+                                f"({format_price(symbol, tp3)}).\n"
+                                f"🆔 Signal : {signal_id}\n"
+                                f"🕐 Événement : {event_time} UTC\n"
                                 f"Trade terminé."
                             )
 
@@ -4054,10 +4009,6 @@ def main_scheduler():
 
             now = datetime.now()
 
-            # ==================================
-            # CRÉNEAU M15
-            # ==================================
-
             m15_slot = now.replace(
                 minute=(now.minute // 15) * 15,
                 second=0,
@@ -4086,10 +4037,6 @@ def main_scheduler():
                 logging.info(
                     "Analyse M15 terminée."
                 )
-
-            # ==================================
-            # CRÉNEAU M5
-            # ==================================
 
             m5_slot = now.replace(
                 minute=(now.minute // 5) * 5,
