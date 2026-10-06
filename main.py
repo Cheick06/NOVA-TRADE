@@ -1,5 +1,3 @@
-Applique la correction. Pas de commentaire.
-
 import os
 import time
 import json
