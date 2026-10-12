@@ -3,7 +3,8 @@ import time
 import json
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -48,7 +49,7 @@ SIGNALS_FILE = "processed_signals.json"
 TRADE_HISTORY_FILE = "trade_history.json"
 WEEKLY_REPORTS_FILE = "weekly_reports.json"
 
-# Opportunités M15 en attente de surveillance M5/M1
+# Opportunités M15 en attente de confirmation M5
 OPPORTUNITIES_FILE = "pending_opportunities.json"
 
 # API BiQuote
@@ -719,10 +720,10 @@ def get_watched_pairs_message():
 
     lines.extend([
         "",
-        "Contexte : H1",
-        "Opportunités : M15",
-        "Surveillance : M5",
-        "Précision : M1 si nécessaire",
+        "Analyse : M15",
+        "Confirmation : M5 (rejet + BOS/CHoCH)",
+        "Setup : rebonds + AMD/liquidité",
+        "Sessions prioritaires : Londres / New York",
         "",
         "Indicateurs : EMA20/EMA50, RSI14, ATR14, ADX14",
         "Filtre : contextuel/contributif"
@@ -762,6 +763,8 @@ def get_bot_status_message():
         "📐 ATR14",
         "📐 ADX14",
         "🧭 Filtre contextuel : actif",
+        "🕒 Timeframes actifs : M15 / M5",
+        "💧 AMD et balayages de liquidité : actifs",
         ""
     ]
 
@@ -963,7 +966,6 @@ def get_statistics(
         "break_even": 0,
         "closed_tp3": 0,
         "closed_sl": 0,
-        "closed_be": 0,
         "closed_other": 0,
         "still_active": 0,
         "symbols": {},
@@ -1178,12 +1180,6 @@ def get_statistics(
                         "closed_sl"
                     ] += 1
 
-                elif result == "BE":
-
-                    statistics[
-                        "closed_be"
-                    ] += 1
-
                 else:
 
                     statistics[
@@ -1227,7 +1223,6 @@ def get_statistics(
     total_closed = (
         statistics["closed_tp3"]
         + statistics["closed_sl"]
-        + statistics.get("closed_be", 0)
         + statistics["closed_other"]
     )
 
@@ -1263,7 +1258,6 @@ def format_statistics_message(
     total_closed = (
         statistics["closed_tp3"]
         + statistics["closed_sl"]
-        + statistics.get("closed_be", 0)
         + statistics["closed_other"]
     )
 
@@ -1283,8 +1277,6 @@ def format_statistics_message(
         f"{statistics['closed_tp3']}",
         f"• SL : "
         f"{statistics['closed_sl']}",
-        f"• Break-Even (sans perte) : "
-        f"{statistics.get('closed_be', 0)}",
         f"• Autres clôtures : "
         f"{statistics['closed_other']}",
         f"• Encore actifs : "
@@ -2116,18 +2108,20 @@ def detect_patterns(
     return None
 
 # ==========================================
-# EXTRACTION DES ZONES H1
+# EXTRACTION DES ZONES M15
 # ==========================================
 
-def get_h1_zones(
-    symbol
+def get_m15_zones(
+    symbol,
+    df=None
 ):
 
-    df = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="1h",
-        count=100
-    )
+    if df is None:
+        df = fetch_biquote_ohlcv(
+            symbol,
+            timeframe="15m",
+            count=100
+        )
 
     if df.empty:
         return [], []
@@ -2152,7 +2146,7 @@ def get_h1_zones(
         ):
 
             logging.warning(
-                f"ATR H1 invalide "
+                f"ATR M15 invalide "
                 f"pour {symbol}."
             )
 
@@ -2231,14 +2225,14 @@ def get_h1_zones(
     except Exception as e:
 
         logging.error(
-            f"Erreur extraction zones H1 "
+            f"Erreur extraction zones M15 "
             f"{symbol}: {e}"
         )
 
         return [], []
 
 # ==========================================
-# INDICATEURS M15
+# INDICATEURS DE CONTEXTE M15
 # ==========================================
 
 def calculate_indicators(
@@ -2621,6 +2615,55 @@ def evaluate_market_filter(
     }
 
 # ==========================================
+# AMD, LIQUIDITÉ ET SESSIONS
+# ==========================================
+
+def get_trading_session():
+    now_utc = datetime.now(timezone.utc)
+    london = now_utc.astimezone(ZoneInfo("Europe/London"))
+    new_york = now_utc.astimezone(ZoneInfo("America/New_York"))
+    london_active = 8 <= london.hour < 17
+    new_york_active = 8 <= new_york.hour < 17
+    if london_active and new_york_active:
+        return "LONDRES + NEW YORK", True
+    if london_active:
+        return "LONDRES", True
+    if new_york_active:
+        return "NEW YORK", True
+    return "HORS SESSION PRIORITAIRE", False
+
+def detect_m15_liquidity_sweep(df):
+    if df is None or len(df) < 25:
+        return None
+    candle = df.iloc[-2]
+    prior = df.iloc[-22:-2]
+    if len(prior) < 15:
+        return None
+    prior_high = float(prior["high"].max())
+    prior_low = float(prior["low"].min())
+    high = float(candle["high"])
+    low = float(candle["low"])
+    close = float(candle["close"])
+    open_price = float(candle["open"])
+    if low < prior_low and close > prior_low and close > open_price:
+        return {"direction": "BUY", "pattern": "AMD_SWEEP_LIQUIDITE_BAISSIERE", "level": prior_low, "range_high": prior_high, "range_low": prior_low}
+    if high > prior_high and close < prior_high and close < open_price:
+        return {"direction": "SELL", "pattern": "AMD_SWEEP_LIQUIDITE_HAUSSIERE", "level": prior_high, "range_high": prior_high, "range_low": prior_low}
+    return None
+
+def detect_m5_structure_break(df, direction):
+    if df is None or len(df) < 6:
+        return False, None
+    candle = df.iloc[-2]
+    previous = df.iloc[-5:-2]
+    close = float(candle["close"])
+    if direction == "BUY":
+        level = float(previous["high"].max())
+        return close > level, level
+    level = float(previous["low"].min())
+    return close < level, level
+
+# ==========================================
 # CRÉATION D'UNE OPPORTUNITÉ M15
 # ==========================================
 
@@ -2636,7 +2679,9 @@ def create_pending_opportunity(
     filter_score,
     indicators,
     zone,
-    candle_id
+    candle_id,
+    setup_type="REBOND_CLASSIQUE",
+    session=None
 ):
     """
     Enregistre l'opportunité M15 pour qu'elle soit
@@ -2661,6 +2706,8 @@ def create_pending_opportunity(
         "symbol": symbol,
         "direction": direction,
         "pattern": pattern,
+        "setup_type": setup_type,
+        "session": session or get_trading_session()[0],
         "entry_price": entry,
         "initial_sl": sl,
         "current_sl": sl,
@@ -2695,302 +2742,101 @@ def create_pending_opportunity(
 def scan_market_m15(
     symbol
 ):
-    """Détecte un setup CRT/liquidité/MSS/FVG-OB en M5, filtré par H1/H4."""
-    logging.info(f"Analyse CRT + liquidité + MSS pour {symbol}...")
+    logging.info(f"Analyse M15 pour {symbol}...")
     try:
-        df_m5 = fetch_biquote_ohlcv(symbol, timeframe="5m", count=180)
-        df_h1 = fetch_biquote_ohlcv(symbol, timeframe="1h", count=100)
-        df_h4 = fetch_biquote_ohlcv(symbol, timeframe="4h", count=80)
-        if df_m5.empty or df_h1.empty or df_h4.empty or len(df_m5) < 30 or len(df_h1) < 25 or len(df_h4) < 25:
-            logging.warning(f"Données insuffisantes pour le setup multi-timeframe {symbol}.")
+        df_m15 = fetch_biquote_ohlcv(symbol, timeframe="15m", count=120)
+        if df_m15.empty or len(df_m15) < 50:
+            logging.warning(f"Données M15 insuffisantes pour {symbol}.")
             return
 
-        for frame in (df_m5, df_h1, df_h4):
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-            frame.dropna(subset=["timestamp"], inplace=True)
-            frame.sort_values("timestamp", inplace=True)
-            frame.reset_index(drop=True, inplace=True)
-        df_h4 = calculate_indicators(df_h4)
-        h4 = df_h4.iloc[-2]
-        h4_close = float(h4["close"])
-        ema20 = float(h4["ema20"]) if pd.notna(h4["ema20"]) else None
-        if ema20 is None:
-            return
-        trend = "BUY" if h4_close > ema20 else "SELL" if h4_close < ema20 else None
-        if trend is None:
+        df_m15 = calculate_indicators(df_m15)
+        market_filter = evaluate_market_filter(df_m15)
+        if market_filter is None:
+            logging.warning(f"Indicateurs M15 incomplets pour {symbol}.")
             return
 
-        last = df_m5.iloc[-2]
-        prev = df_m5.iloc[-3]
-        candle_time = last["timestamp"]
-        candle_id = f"{symbol}_CRT_M5_{candle_time.isoformat()}"
-        processed = load_json(SIGNALS_FILE)
-        if candle_id in processed:
+        last_candle = df_m15.iloc[-2]
+        candle_timestamp = last_candle["timestamp"]
+        candle_id = f"{symbol}_M15_{candle_timestamp}"
+        processed_signals = load_json(SIGNALS_FILE)
+        if candle_id in processed_signals:
             return
 
-        # Range asiatique UTC du jour de la bougie clôturée.
-        day_start = candle_time.normalize()
-        asian = df_m5[(df_m5["timestamp"] >= day_start) & (df_m5["timestamp"] < day_start + pd.Timedelta(hours=6))]
-        if len(asian) < 6:
-            logging.info(f"Range asiatique incomplet pour {symbol}; attente de données suffisantes.")
-            return
-        asia_high = float(asian["high"].max())
-        asia_low = float(asian["low"].min())
+        supports, resistances = get_m15_zones(symbol, df_m15)
+        pattern = detect_patterns(df_m15)
+        sweep = detect_m15_liquidity_sweep(df_m15)
+        session, priority_session = get_trading_session()
+        candidates = []
 
-        # CRT : dernière bougie H1 clôturée, utilisée comme range de référence secondaire.
-        h1 = df_h1.iloc[-2]
-        crt_high = float(h1["high"])
-        crt_low = float(h1["low"])
-        prior = df_m5.iloc[-8:-2]
-        if len(prior) < 4:
+        if sweep:
+            direction = sweep["direction"]
+            score = market_filter["buy_score"] if direction == "BUY" else market_filter["sell_score"]
+            minimum_sweep_score = 1 if priority_session else 2
+            if score >= minimum_sweep_score:
+                candidates.append({
+                    "direction": direction,
+                    "pattern": sweep["pattern"],
+                    "setup_type": "AMD_LIQUIDITE",
+                    "zone": {"level": sweep["level"], "low_band": sweep["range_low"], "high_band": sweep["range_high"]},
+                    "score": score
+                })
+
+        if pattern in ["AVALEMENT_HAUSSIER", "MARTEAU"]:
+            if market_filter["buy_score"] >= 2:
+                for support in supports:
+                    if float(last_candle["low"]) <= support["high_band"] and float(last_candle["close"]) >= support["low_band"]:
+                        candidates.append({"direction": "BUY", "pattern": pattern, "setup_type": "REBOND_CLASSIQUE", "zone": support, "score": market_filter["buy_score"]})
+                        break
+
+        if pattern in ["AVALEMENT_BAISSIER", "ETOILE_FILANTE"]:
+            if market_filter["sell_score"] >= 2:
+                for resistance in resistances:
+                    if float(last_candle["high"]) >= resistance["low_band"] and float(last_candle["close"]) <= resistance["high_band"]:
+                        candidates.append({"direction": "SELL", "pattern": pattern, "setup_type": "REBOND_CLASSIQUE", "zone": resistance, "score": market_filter["sell_score"]})
+                        break
+
+        if not candidates:
+            logging.info(f"Aucun rebond ou sweep M15 valide pour {symbol}.")
             return
-        prior_high = float(prior["high"].max())
-        prior_low = float(prior["low"].min())
-        o, c, hi, lo = (float(last[k]) for k in ("open", "close", "high", "low"))
-        atr_frame = calculate_indicators(df_m5)
-        atr = float(atr_frame.iloc[-2]["atr14"]) if pd.notna(atr_frame.iloc[-2]["atr14"]) else 0.0
+
+        if not priority_session:
+            logging.info(f"{symbol}: setup valide hors session prioritaire; conservé sous confirmation stricte M5.")
+
+        candidate = candidates[0]
+        direction = candidate["direction"]
+        entry = float(last_candle["close"])
+        atr = float(last_candle.get("atr14", 0) or 0)
         if atr <= 0:
-            return
+            atr = max(float(last_candle["high"]) - float(last_candle["low"]), entry * 0.001)
 
-        direction = None
-        sweep_level = None
-        sweep_extreme = None
-        sweep_name = None
-        # Sweep : dépassement d'un extrême asiatique ou CRT puis clôture de réintégration.
-        swept_low = lo < min(asia_low, crt_low) and c > min(asia_low, crt_low) and c > o
-        swept_high = hi > max(asia_high, crt_high) and c < max(asia_high, crt_high) and c < o
-        # Autoriser le sweep de l'un des deux niveaux, sans exiger que les deux soient dépassés.
-        swept_low = swept_low or (lo < asia_low and c > asia_low and c > o) or (lo < crt_low and c > crt_low and c > o)
-        swept_high = swept_high or (hi > asia_high and c < asia_high and c < o) or (hi > crt_high and c < crt_high and c < o)
-
-        # MSS : clôture qui dépasse la structure des bougies précédentes dans le sens du retournement.
-        if swept_low and c > prior_high and trend == "BUY":
-            direction, sweep_level, sweep_extreme, sweep_name = "BUY", min(asia_low, crt_low), lo, "SWEEP_LOW"
-        elif swept_high and c < prior_low and trend == "SELL":
-            direction, sweep_level, sweep_extreme, sweep_name = "SELL", max(asia_high, crt_high), hi, "SWEEP_HIGH"
-        if direction is None:
-            logging.info(f"Aucun setup complet sweep + MSS aligné EMA20 H4 pour {symbol}.")
-            return
-
-        # Zone d'entrée : FVG récent, sinon OB simple (dernière bougie opposée avant impulsion).
-        zone = None
         if direction == "BUY":
-            for i in range(len(df_m5)-4, max(1, len(df_m5)-14), -1):
-                a, b = df_m5.iloc[i-1], df_m5.iloc[i+1]
-                if float(a["high"]) < float(b["low"]):
-                    zone = {"type": "FVG", "low_band": float(a["high"]), "high_band": float(b["low"])}
-                    break
-            if zone is None:
-                opposites = df_m5.iloc[-8:-2]
-                opposites = opposites[opposites["close"] < opposites["open"]]
-                if not opposites.empty:
-                    ob = opposites.iloc[-1]
-                    zone = {"type": "OB", "low_band": float(ob["low"]), "high_band": float(ob["high"])}
-            sl = min(float(sweep_extreme), float(zone["low_band"]) if zone else float(sweep_extreme)) - max(atr * 0.15, abs(c) * 0.0001)
-            risk = c - sl
-            target_liquidity = max(asia_high, crt_high, prior_high)
-            tp1 = c + risk
-            tp2 = c + 2 * risk
-            tp3 = max(c + 3 * risk, target_liquidity) if target_liquidity > c else c + 3 * risk
+            structural_low = min(float(last_candle["low"]), float(candidate["zone"].get("low_band", last_candle["low"])))
+            sl = structural_low - max(atr * 0.15, entry * 0.0002)
+            risk = entry - sl
+            tp1, tp2, tp3 = entry + risk, entry + 2 * risk, entry + 3 * risk
         else:
-            for i in range(len(df_m5)-4, max(1, len(df_m5)-14), -1):
-                a, b = df_m5.iloc[i-1], df_m5.iloc[i+1]
-                if float(a["low"]) > float(b["high"]):
-                    zone = {"type": "FVG", "low_band": float(b["high"]), "high_band": float(a["low"])}
-                    break
-            if zone is None:
-                opposites = df_m5.iloc[-8:-2]
-                opposites = opposites[opposites["close"] > opposites["open"]]
-                if not opposites.empty:
-                    ob = opposites.iloc[-1]
-                    zone = {"type": "OB", "low_band": float(ob["low"]), "high_band": float(ob["high"])}
-            sl = max(float(sweep_extreme), float(zone["high_band"]) if zone else float(sweep_extreme)) + max(atr * 0.15, abs(c) * 0.0001)
-            risk = sl - c
-            target_liquidity = min(asia_low, crt_low, prior_low)
-            tp1 = c - risk
-            tp2 = c - 2 * risk
-            tp3 = min(c - 3 * risk, target_liquidity) if target_liquidity < c else c - 3 * risk
-        if risk <= 0 or risk < atr * 0.25 or risk > atr * 5:
-            logging.info(f"Setup rejeté: SL incohérent ou trop éloigné pour {symbol}.")
+            structural_high = max(float(last_candle["high"]), float(candidate["zone"].get("high_band", last_candle["high"])))
+            sl = structural_high + max(atr * 0.15, entry * 0.0002)
+            risk = sl - entry
+            tp1, tp2, tp3 = entry - risk, entry - 2 * risk, entry - 3 * risk
+
+        if risk <= 0:
             return
 
-        # Premium/Discount : BUY dans la moitié basse du range, SELL dans la moitié haute.
-        dealing_high = max(asia_high, crt_high)
-        dealing_low = min(asia_low, crt_low)
-        midpoint = (dealing_high + dealing_low) / 2
-        if direction == "BUY" and c > midpoint:
-            logging.info(f"BUY écarté: prix en premium pour {symbol}.")
-            return
-        if direction == "SELL" and c < midpoint:
-            logging.info(f"SELL écarté: prix en discount pour {symbol}.")
-            return
+        indicators = {key: market_filter[key] for key in ["ema20", "ema50", "rsi14", "atr14", "adx14"]}
+        candidate_id = create_pending_opportunity(
+            symbol=symbol, direction=direction, pattern=candidate["pattern"],
+            entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+            filter_score=candidate["score"], indicators=indicators,
+            zone=candidate["zone"], candle_id=candle_id,
+            setup_type=candidate["setup_type"], session=session
+        )
+        processed_signals[candle_id] = candidate_id
+        save_json(SIGNALS_FILE, processed_signals)
+        logging.info(f"Opportunité {candidate['setup_type']} {direction} M15 créée: {candidate_id}; session={session}.")
 
-        # Le FVG/OB doit être identifiable; la surveillance M5 valide ensuite le retest.
-        if not zone:
-            logging.info(f"Aucun FVG/OB exploitable pour {symbol}.")
-            return
-        zone.update({"crt_high": crt_high, "crt_low": crt_low, "asia_high": asia_high, "asia_low": asia_low, "sweep_level": sweep_level, "sweep_extreme": sweep_extreme, "mss_confirmed": True, "ema20_h4": ema20, "trend_h4": trend, "premium_discount_mid": midpoint})
-        indicators = {"ema20_h4": ema20, "trend_h4": trend, "atr14_m5": atr, "crt_high": crt_high, "crt_low": crt_low, "asia_high": asia_high, "asia_low": asia_low, "mss_confirmed": True}
-        candidate_id = create_pending_opportunity(symbol=symbol, direction=direction, pattern=f"{sweep_name}_MSS_{zone['type']}_CRT_EMA20", entry=c, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, filter_score=3, indicators=indicators, zone=zone, candle_id=candle_id)
-        processed[candle_id] = True
-        save_json(SIGNALS_FILE, processed)
-        logging.info(f"Setup {direction} créé: {candidate_id} | CRT + sweep + MSS + {zone['type']} + Premium/Discount + EMA20 H4.")
     except Exception as e:
-        logging.exception(f"Erreur scan stratégie CRT {symbol}: {e}")
-
-
-# ==========================================
-# STRATÉGIE INDÉPENDANTE : SNIPER
-# ==========================================
-
-def scan_market_sniper(
-    symbol
-):
-    """Détecte un setup CRT/liquidité/MSS/FVG-OB en M5, filtré par H1/H4."""
-    logging.info(f"Analyse SNIPER CRT + liquidité + MSS + FVG pour {symbol}...")
-    try:
-        df_m5 = fetch_biquote_ohlcv(symbol, timeframe="5m", count=180)
-        df_h1 = fetch_biquote_ohlcv(symbol, timeframe="1h", count=100)
-        df_h4 = fetch_biquote_ohlcv(symbol, timeframe="4h", count=80)
-        if df_m5.empty or df_h1.empty or df_h4.empty or len(df_m5) < 30 or len(df_h1) < 25 or len(df_h4) < 25:
-            logging.warning(f"Données insuffisantes pour le setup multi-timeframe {symbol}.")
-            return
-
-        for frame in (df_m5, df_h1, df_h4):
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-            frame.dropna(subset=["timestamp"], inplace=True)
-            frame.sort_values("timestamp", inplace=True)
-            frame.reset_index(drop=True, inplace=True)
-        df_h4 = calculate_indicators(df_h4)
-        h4 = df_h4.iloc[-2]
-        h4_close = float(h4["close"])
-        ema20 = float(h4["ema20"]) if pd.notna(h4["ema20"]) else None
-        if ema20 is None:
-            return
-        trend = "BUY" if h4_close > ema20 else "SELL" if h4_close < ema20 else None
-        if trend is None:
-            return
-
-        last = df_m5.iloc[-2]
-        prev = df_m5.iloc[-3]
-        candle_time = last["timestamp"]
-        candle_id = f"{symbol}_SNIPER_M5_{candle_time.isoformat()}"
-        processed = load_json(SIGNALS_FILE)
-        if candle_id in processed:
-            return
-
-        # Range asiatique UTC du jour de la bougie clôturée.
-        day_start = candle_time.normalize()
-        asian = df_m5[(df_m5["timestamp"] >= day_start) & (df_m5["timestamp"] < day_start + pd.Timedelta(hours=6))]
-        if len(asian) < 6:
-            logging.info(f"Range asiatique incomplet pour {symbol}; attente de données suffisantes.")
-            return
-        asia_high = float(asian["high"].max())
-        asia_low = float(asian["low"].min())
-
-        # CRT : dernière bougie H1 clôturée, utilisée comme range de référence secondaire.
-        h1 = df_h1.iloc[-2]
-        crt_high = float(h1["high"])
-        crt_low = float(h1["low"])
-        prior = df_m5.iloc[-8:-2]
-        if len(prior) < 4:
-            return
-        prior_high = float(prior["high"].max())
-        prior_low = float(prior["low"].min())
-        o, c, hi, lo = (float(last[k]) for k in ("open", "close", "high", "low"))
-        atr_frame = calculate_indicators(df_m5)
-        atr = float(atr_frame.iloc[-2]["atr14"]) if pd.notna(atr_frame.iloc[-2]["atr14"]) else 0.0
-        if atr <= 0:
-            return
-
-        direction = None
-        sweep_level = None
-        sweep_extreme = None
-        sweep_name = None
-        # Sweep : dépassement d'un extrême asiatique ou CRT puis clôture de réintégration.
-        swept_low = lo < min(asia_low, crt_low) and c > min(asia_low, crt_low) and c > o
-        swept_high = hi > max(asia_high, crt_high) and c < max(asia_high, crt_high) and c < o
-        # Autoriser le sweep de l'un des deux niveaux, sans exiger que les deux soient dépassés.
-        swept_low = swept_low or (lo < asia_low and c > asia_low and c > o) or (lo < crt_low and c > crt_low and c > o)
-        swept_high = swept_high or (hi > asia_high and c < asia_high and c < o) or (hi > crt_high and c < crt_high and c < o)
-
-        # MSS : clôture qui dépasse la structure des bougies précédentes dans le sens du retournement.
-        if swept_low and c > prior_high and trend == "BUY":
-            direction, sweep_level, sweep_extreme, sweep_name = "BUY", min(asia_low, crt_low), lo, "SWEEP_LOW"
-        elif swept_high and c < prior_low and trend == "SELL":
-            direction, sweep_level, sweep_extreme, sweep_name = "SELL", max(asia_high, crt_high), hi, "SWEEP_HIGH"
-        if direction is None:
-            logging.info(f"Aucun setup complet sweep + MSS aligné EMA20 H4 pour {symbol}.")
-            return
-
-        # Zone d'entrée : FVG récent, sinon OB simple (dernière bougie opposée avant impulsion).
-        zone = None
-        if direction == "BUY":
-            for i in range(len(df_m5)-4, max(1, len(df_m5)-14), -1):
-                a, b = df_m5.iloc[i-1], df_m5.iloc[i+1]
-                if float(a["high"]) < float(b["low"]):
-                    zone = {"type": "FVG", "low_band": float(a["high"]), "high_band": float(b["low"])}
-                    break
-            if zone is None:
-                opposites = df_m5.iloc[-8:-2]
-                opposites = opposites[opposites["close"] < opposites["open"]]
-                if not opposites.empty:
-                    ob = opposites.iloc[-1]
-                    zone = {"type": "OB", "low_band": float(ob["low"]), "high_band": float(ob["high"])}
-            sl = min(float(sweep_extreme), float(zone["low_band"]) if zone else float(sweep_extreme)) - max(atr * 0.15, abs(c) * 0.0001)
-            sniper_entry = float(zone["high_band"]) if zone else c
-            risk = sniper_entry - sl
-            target_liquidity = max(asia_high, crt_high, prior_high)
-            tp1 = sniper_entry + risk
-            tp2 = sniper_entry + 2 * risk
-            tp3 = max(sniper_entry + 3.5 * risk, target_liquidity) if target_liquidity > sniper_entry else sniper_entry + 3.5 * risk
-        else:
-            for i in range(len(df_m5)-4, max(1, len(df_m5)-14), -1):
-                a, b = df_m5.iloc[i-1], df_m5.iloc[i+1]
-                if float(a["low"]) > float(b["high"]):
-                    zone = {"type": "FVG", "low_band": float(b["high"]), "high_band": float(a["low"])}
-                    break
-            if zone is None:
-                opposites = df_m5.iloc[-8:-2]
-                opposites = opposites[opposites["close"] > opposites["open"]]
-                if not opposites.empty:
-                    ob = opposites.iloc[-1]
-                    zone = {"type": "OB", "low_band": float(ob["low"]), "high_band": float(ob["high"])}
-            sl = max(float(sweep_extreme), float(zone["high_band"]) if zone else float(sweep_extreme)) + max(atr * 0.15, abs(c) * 0.0001)
-            sniper_entry = float(zone["low_band"]) if zone else c
-            risk = sl - sniper_entry
-            target_liquidity = min(asia_low, crt_low, prior_low)
-            tp1 = sniper_entry - risk
-            tp2 = sniper_entry - 2 * risk
-            tp3 = min(sniper_entry - 3.5 * risk, target_liquidity) if target_liquidity < sniper_entry else sniper_entry - 3.5 * risk
-        if risk <= 0 or risk < atr * 0.15 or risk > atr * 3.0:
-            logging.info(f"Setup rejeté: SL incohérent ou trop éloigné pour {symbol}.")
-            return
-
-        # Premium/Discount : BUY dans la moitié basse du range, SELL dans la moitié haute.
-        dealing_high = max(asia_high, crt_high)
-        dealing_low = min(asia_low, crt_low)
-        midpoint = (dealing_high + dealing_low) / 2
-        if direction == "BUY" and float(zone["high_band"]) > midpoint:
-            logging.info(f"BUY écarté: prix en premium pour {symbol}.")
-            return
-        if direction == "SELL" and float(zone["low_band"]) < midpoint:
-            logging.info(f"SELL écarté: prix en discount pour {symbol}.")
-            return
-
-        # Le FVG/OB doit être identifiable; la surveillance M5 valide ensuite le retest.
-        if not zone:
-            logging.info(f"Aucun FVG/OB exploitable pour {symbol}.")
-            return
-        zone.update({"crt_high": crt_high, "crt_low": crt_low, "asia_high": asia_high, "asia_low": asia_low, "sweep_level": sweep_level, "sweep_extreme": sweep_extreme, "mss_confirmed": True, "ema20_h4": ema20, "trend_h4": trend, "premium_discount_mid": midpoint})
-        indicators = {"ema20_h4": ema20, "trend_h4": trend, "atr14_m5": atr, "crt_high": crt_high, "crt_low": crt_low, "asia_high": asia_high, "asia_low": asia_low, "mss_confirmed": True}
-        candidate_id = create_pending_opportunity(symbol=symbol, direction=direction, pattern=f"SNIPER_{sweep_name}_MSS_{zone['type']}_CRT_EMA20", entry=(float(zone['high_band']) if direction == "BUY" else float(zone['low_band'])), sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, filter_score=3, indicators=indicators, zone=zone, candle_id=candle_id)
-        processed[candle_id] = True
-        save_json(SIGNALS_FILE, processed)
-        logging.info(f"Setup SNIPER {direction} créé: {candidate_id} | CRT + sweep + MSS + {zone['type']} + entrée sur borne FVG/OB + EMA20 H4.")
-    except Exception as e:
-        logging.exception(f"Erreur scan stratégie SNIPER {symbol}: {e}")
-
+        logging.exception(f"Erreur scan_market_m15 {symbol}: {e}")
 
 # ==========================================
 # CONFIRMATION M5
@@ -2999,273 +2845,42 @@ def scan_market_sniper(
 def evaluate_m5_opportunity(
     opportunity
 ):
-    """
-    Surveille une opportunité M15 avec M5.
-
-    M5 ne recalcule pas la stratégie M15 :
-    il sert uniquement à surveiller le moment où
-    l'opportunité devient exploitable.
-
-    Une bougie M5 clôturée dans le même sens que
-    l'opportunité constitue la confirmation M5.
-    """
-
-    symbol = opportunity.get(
-        "symbol"
-    )
-
-    direction = opportunity.get(
-        "direction"
-    )
-
-    entry = float(
-        opportunity.get(
-            "entry_price"
-        )
-    )
-
-    initial_sl = float(
-        opportunity.get(
-            "initial_sl"
-        )
-    )
-
-    df_m5 = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="5m",
-        count=100
-    )
-
-    if df_m5.empty or len(df_m5) < 4:
-
-        logging.warning(
-            f"Données M5 insuffisantes "
-            f"pour {symbol}."
-        )
-
+    symbol = opportunity.get("symbol")
+    direction = opportunity.get("direction")
+    initial_sl = float(opportunity.get("initial_sl"))
+    df_m5 = fetch_biquote_ohlcv(symbol, timeframe="5m", count=100)
+    if df_m5.empty or len(df_m5) < 10:
+        logging.warning(f"Données M5 insuffisantes pour {symbol}.")
         return "WAIT", None
 
     last_m5 = df_m5.iloc[-2]
+    m5_open = float(last_m5["open"])
+    m5_close = float(last_m5["close"])
+    m5_high = float(last_m5["high"])
+    m5_low = float(last_m5["low"])
 
-    m5_open = float(
-        last_m5["open"]
-    )
+    if direction == "BUY" and m5_low <= initial_sl:
+        return "INVALIDATED", None
+    if direction == "SELL" and m5_high >= initial_sl:
+        return "INVALIDATED", None
 
-    m5_close = float(
-        last_m5["close"]
-    )
-
-    m5_high = float(
-        last_m5["high"]
-    )
-
-    m5_low = float(
-        last_m5["low"]
-    )
-
-    # ======================================
-    # INVALIDATION PAR LE SL
-    # ======================================
-
+    m5_pattern = detect_patterns(df_m5)
     if direction == "BUY":
-
-        if m5_low <= initial_sl:
-
-            return "INVALIDATED", None
-
-        m5_direction_ok = (
-            m5_close > m5_open
-            and
-            m5_close >= entry
-        )
-
+        pattern_ok = m5_pattern in ["AVALEMENT_HAUSSIER", "MARTEAU"] and m5_close > m5_open
     else:
+        pattern_ok = m5_pattern in ["AVALEMENT_BAISSIER", "ETOILE_FILANTE"] and m5_close < m5_open
 
-        if m5_high >= initial_sl:
-
-            return "INVALIDATED", None
-
-        m5_direction_ok = (
-            m5_close < m5_open
-            and
-            m5_close <= entry
-        )
-
-    if not m5_direction_ok:
-
+    structure_ok, structure_level = detect_m5_structure_break(df_m5, direction)
+    if not pattern_ok or not structure_ok:
         return "WAIT", None
 
-    m5_pattern = detect_patterns(
-        df_m5
-    )
-
-    if direction == "BUY":
-
-        pattern_ok = m5_pattern in [
-            "AVALEMENT_HAUSSIER",
-            "MARTEAU"
-        ]
-
-    else:
-
-        pattern_ok = m5_pattern in [
-            "AVALEMENT_BAISSIER",
-            "ETOILE_FILANTE"
-        ]
-
-    # ======================================
-    # M5 CONFIRMÉ
-    # ======================================
-
     confirmation = {
-        "m5_pattern": m5_pattern,
-        "m5_open": m5_open,
-        "m5_close": m5_close,
-        "m5_high": m5_high,
-        "m5_low": m5_low,
-        "pattern_ok": pattern_ok
+        "m5_pattern": m5_pattern, "m5_open": m5_open, "m5_close": m5_close,
+        "m5_high": m5_high, "m5_low": m5_low,
+        "pattern_ok": pattern_ok, "structure_break": True,
+        "structure_level": structure_level
     }
-
     return "CONFIRMED", confirmation
-
-# ==========================================
-# VÉRIFICATION M1 SI NÉCESSAIRE
-# ==========================================
-
-def evaluate_m1_if_necessary(
-    opportunity,
-    m5_confirmation
-):
-    """
-    M1 est utilisé uniquement lorsque le mouvement
-    M5 est déjà confirmé mais que le prix s'est éloigné
-    de manière importante du prix de référence M15.
-
-    Si le M5 est proche de l'entrée, M1 n'est pas
-    nécessaire.
-
-    Lorsque M1 est utilisé, une confirmation dans le
-    même sens permet de finaliser le signal.
-    """
-
-    symbol = opportunity.get(
-        "symbol"
-    )
-
-    direction = opportunity.get(
-        "direction"
-    )
-
-    entry = float(
-        opportunity.get(
-            "entry_price"
-        )
-    )
-
-    m5_close = float(
-        m5_confirmation.get(
-            "m5_close"
-        )
-    )
-
-    df_m5 = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="5m",
-        count=100
-    )
-
-    if df_m5.empty or len(df_m5) < 20:
-
-        return True, False
-
-    df_m5_indicators = calculate_indicators(
-        df_m5
-    )
-
-    last_m5 = df_m5_indicators.iloc[-2]
-
-    atr14 = last_m5.get(
-        "atr14"
-    )
-
-    if pd.isna(atr14) or float(atr14) <= 0:
-
-        return True, False
-
-    atr14 = float(atr14)
-
-    distance = abs(
-        m5_close
-        - entry
-    )
-
-    # M1 n'est nécessaire que si le prix s'est
-    # éloigné de plus de 0.25 ATR M5.
-    m1_needed = (
-        distance
-        > (
-            atr14
-            * 0.25
-        )
-    )
-
-    if not m1_needed:
-
-        return True, False
-
-    logging.info(
-        f"M1 nécessaire pour {symbol} "
-        f"après confirmation M5."
-    )
-
-    df_m1 = fetch_biquote_ohlcv(
-        symbol,
-        timeframe="1m",
-        count=100
-    )
-
-    if df_m1.empty or len(df_m1) < 4:
-
-        logging.warning(
-            f"Données M1 insuffisantes "
-            f"pour {symbol}. "
-            f"Surveillance maintenue."
-        )
-
-        return False, True
-
-    m1_pattern = detect_patterns(
-        df_m1
-    )
-
-    if direction == "BUY":
-
-        m1_ok = m1_pattern in [
-            "AVALEMENT_HAUSSIER",
-            "MARTEAU"
-        ]
-
-    else:
-
-        m1_ok = m1_pattern in [
-            "AVALEMENT_BAISSIER",
-            "ETOILE_FILANTE"
-        ]
-
-    if not m1_ok:
-
-        logging.info(
-            f"M1 ne confirme pas encore "
-            f"{direction} pour {symbol}."
-        )
-
-        return False, True
-
-    logging.info(
-        f"M1 confirme {direction} pour {symbol}."
-    )
-
-    return True, True
 
 # ==========================================
 # TRANSFORMATION DE L'OPPORTUNITÉ
@@ -3277,11 +2892,11 @@ def finalize_pending_opportunity(
     opportunity
 ):
     """
-    Transforme une opportunité M15 confirmée par M5/M1
+    Transforme une opportunité M15 confirmée par M5
     en trade actif.
 
     Les valeurs Entry / SL / TP sont reprises
-    exactement de l'opportunité M15.
+    de l'opportunité M15.
     """
 
     opportunities = load_json(
@@ -3399,18 +3014,16 @@ def finalize_pending_opportunity(
         ]
     )
 
-    if str(pattern or "").startswith("SNIPER_"):
-        send_telegram_message("🎯 *SIGNAL SNIPER*")
-
-    elif direction == "BUY":
+    if direction == "BUY":
 
         send_telegram_message(
             f"🟢 *SIGNAL ACHAT (BUY) "
             f"via BIQUOTE*\n"
             f"Actif: {symbol}\n"
             f"Motif: {pattern}\n"
-            f"Confirmation: M15 → M5"
-            f" → M1 si nécessaire\n"
+            f"Timeframes: M15 → M5\n"
+            f"Setup: {opportunity.get('setup_type', 'REBOND_CLASSIQUE')}\n"
+            f"Session: {opportunity.get('session', 'N/A')}\n"
             f"Filtre: "
             f"{filter_score}/4\n"
             f"EMA20/50: "
@@ -3439,8 +3052,9 @@ def finalize_pending_opportunity(
             f"(SHORT) via BIQUOTE*\n"
             f"Actif: {symbol}\n"
             f"Motif: {pattern}\n"
-            f"Confirmation: M15 → M5"
-            f" → M1 si nécessaire\n"
+            f"Timeframes: M15 → M5\n"
+            f"Setup: {opportunity.get('setup_type', 'REBOND_CLASSIQUE')}\n"
+            f"Session: {opportunity.get('session', 'N/A')}\n"
             f"Filtre: "
             f"{filter_score}/4\n"
             f"EMA20/50: "
@@ -3487,14 +3101,7 @@ def scan_pending_opportunities_m5():
     """
     Parcourt les opportunités détectées par M15.
 
-    Flux :
-        M15 → opportunité
-             ↓
-        M5 surveillance
-             ↓
-        M1 si nécessaire
-             ↓
-        signal final
+    Flux : M15 → confirmation M5 (rejet + cassure de structure) → signal final.
     """
 
     opportunities = load_json(
@@ -3562,44 +3169,11 @@ def scan_pending_opportunities_m5():
                 "m5_confirmation"
             ] = m5_confirmation
 
-            should_finalize, m1_used = (
-                evaluate_m1_if_necessary(
-                    opportunity,
-                    m5_confirmation
-                )
-            )
-
-            if not should_finalize:
-
-                opportunity[
-                    "status"
-                ] = "M5_SURVEILLANCE"
-
-                opportunities[
-                    candidate_id
-                ] = opportunity
-
-                if m1_used:
-
-                    logging.info(
-                        f"{symbol} {direction} : "
-                        f"M5 confirmé, M1 en attente."
-                    )
-
-                continue
-
-            # ==================================
-            # SIGNAL FINAL
-            # ==================================
-
             finalize_pending_opportunity(
                 candidate_id,
                 opportunity
             )
-
-            opportunities_to_delete.append(
-                candidate_id
-            )
+            opportunities_to_delete.append(candidate_id)
 
         except Exception as e:
 
@@ -3726,20 +3300,22 @@ def track_active_trades():
 
                         if current_price <= current_sl:
 
-                            close_result = "BE" if status in ("TP1_HIT", "TP2_HIT") and abs(current_sl - entry) <= max(abs(entry) * 0.000001, 0.000001) else "SL"
-                            if close_result == "BE":
-                                record_trade_event(t_id, "BREAK_EVEN_CLOSED", current_price)
                             send_telegram_message(
-                                (f"🟰 *Break-Even atteint* sur {symbol}. Trade clôturé sans perte." if close_result == "BE" else f"❌ *SL Touché* sur {symbol} à {current_price:.2f}.\nTrade clos." )
+                                f"❌ *SL Touché* sur "
+                                f"{symbol} "
+                                f"à {current_price:.2f}.\n"
+                                f"Trade clos."
                             )
 
                             close_trade_in_history(
                                 t_id,
-                                close_result,
+                                "SL",
                                 current_price
                             )
 
-                            trades_to_delete.append(t_id)
+                            trades_to_delete.append(
+                                t_id
+                            )
 
                         elif (
                             current_price >= tp1
@@ -3830,20 +3406,23 @@ def track_active_trades():
 
                         if current_price >= current_sl:
 
-                            close_result = "BE" if status in ("TP1_HIT", "TP2_HIT") and abs(current_sl - entry) <= max(abs(entry) * 0.000001, 0.000001) else "SL"
-                            if close_result == "BE":
-                                record_trade_event(t_id, "BREAK_EVEN_CLOSED", current_price)
                             send_telegram_message(
-                                (f"🟰 *Break-Even atteint* sur {symbol}. Trade clôturé sans perte." if close_result == "BE" else f"❌ *SL Touché (Short)* sur {symbol} à {current_price:.2f}.\nTrade clos.")
+                                f"❌ *SL Touché* "
+                                f"(Short) sur "
+                                f"{symbol} "
+                                f"à {current_price:.2f}.\n"
+                                f"Trade clos."
                             )
 
                             close_trade_in_history(
                                 t_id,
-                                close_result,
+                                "SL",
                                 current_price
                             )
 
-                            trades_to_delete.append(t_id)
+                            trades_to_delete.append(
+                                t_id
+                            )
 
                         elif (
                             current_price <= tp1
@@ -4003,10 +3582,6 @@ def main_scheduler():
                 for symbol in SYMBOLS:
 
                     scan_market_m15(
-                        symbol
-                    )
-
-                    scan_market_sniper(
                         symbol
                     )
 
