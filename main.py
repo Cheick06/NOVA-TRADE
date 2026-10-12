@@ -963,6 +963,7 @@ def get_statistics(
         "break_even": 0,
         "closed_tp3": 0,
         "closed_sl": 0,
+        "closed_be": 0,
         "closed_other": 0,
         "still_active": 0,
         "symbols": {},
@@ -1177,6 +1178,12 @@ def get_statistics(
                         "closed_sl"
                     ] += 1
 
+                elif result == "BE":
+
+                    statistics[
+                        "closed_be"
+                    ] += 1
+
                 else:
 
                     statistics[
@@ -1220,6 +1227,7 @@ def get_statistics(
     total_closed = (
         statistics["closed_tp3"]
         + statistics["closed_sl"]
+        + statistics.get("closed_be", 0)
         + statistics["closed_other"]
     )
 
@@ -1255,6 +1263,7 @@ def format_statistics_message(
     total_closed = (
         statistics["closed_tp3"]
         + statistics["closed_sl"]
+        + statistics.get("closed_be", 0)
         + statistics["closed_other"]
     )
 
@@ -1274,6 +1283,8 @@ def format_statistics_message(
         f"{statistics['closed_tp3']}",
         f"• SL : "
         f"{statistics['closed_sl']}",
+        f"• Break-Even (sans perte) : "
+        f"{statistics.get('closed_be', 0)}",
         f"• Autres clôtures : "
         f"{statistics['closed_other']}",
         f"• Encore actifs : "
@@ -2827,6 +2838,160 @@ def scan_market_m15(
     except Exception as e:
         logging.exception(f"Erreur scan stratégie CRT {symbol}: {e}")
 
+
+# ==========================================
+# STRATÉGIE INDÉPENDANTE : SNIPER
+# ==========================================
+
+def scan_market_sniper(
+    symbol
+):
+    """Détecte un setup CRT/liquidité/MSS/FVG-OB en M5, filtré par H1/H4."""
+    logging.info(f"Analyse SNIPER CRT + liquidité + MSS + FVG pour {symbol}...")
+    try:
+        df_m5 = fetch_biquote_ohlcv(symbol, timeframe="5m", count=180)
+        df_h1 = fetch_biquote_ohlcv(symbol, timeframe="1h", count=100)
+        df_h4 = fetch_biquote_ohlcv(symbol, timeframe="4h", count=80)
+        if df_m5.empty or df_h1.empty or df_h4.empty or len(df_m5) < 30 or len(df_h1) < 25 or len(df_h4) < 25:
+            logging.warning(f"Données insuffisantes pour le setup multi-timeframe {symbol}.")
+            return
+
+        for frame in (df_m5, df_h1, df_h4):
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            frame.dropna(subset=["timestamp"], inplace=True)
+            frame.sort_values("timestamp", inplace=True)
+            frame.reset_index(drop=True, inplace=True)
+        df_h4 = calculate_indicators(df_h4)
+        h4 = df_h4.iloc[-2]
+        h4_close = float(h4["close"])
+        ema20 = float(h4["ema20"]) if pd.notna(h4["ema20"]) else None
+        if ema20 is None:
+            return
+        trend = "BUY" if h4_close > ema20 else "SELL" if h4_close < ema20 else None
+        if trend is None:
+            return
+
+        last = df_m5.iloc[-2]
+        prev = df_m5.iloc[-3]
+        candle_time = last["timestamp"]
+        candle_id = f"{symbol}_SNIPER_M5_{candle_time.isoformat()}"
+        processed = load_json(SIGNALS_FILE)
+        if candle_id in processed:
+            return
+
+        # Range asiatique UTC du jour de la bougie clôturée.
+        day_start = candle_time.normalize()
+        asian = df_m5[(df_m5["timestamp"] >= day_start) & (df_m5["timestamp"] < day_start + pd.Timedelta(hours=6))]
+        if len(asian) < 6:
+            logging.info(f"Range asiatique incomplet pour {symbol}; attente de données suffisantes.")
+            return
+        asia_high = float(asian["high"].max())
+        asia_low = float(asian["low"].min())
+
+        # CRT : dernière bougie H1 clôturée, utilisée comme range de référence secondaire.
+        h1 = df_h1.iloc[-2]
+        crt_high = float(h1["high"])
+        crt_low = float(h1["low"])
+        prior = df_m5.iloc[-8:-2]
+        if len(prior) < 4:
+            return
+        prior_high = float(prior["high"].max())
+        prior_low = float(prior["low"].min())
+        o, c, hi, lo = (float(last[k]) for k in ("open", "close", "high", "low"))
+        atr_frame = calculate_indicators(df_m5)
+        atr = float(atr_frame.iloc[-2]["atr14"]) if pd.notna(atr_frame.iloc[-2]["atr14"]) else 0.0
+        if atr <= 0:
+            return
+
+        direction = None
+        sweep_level = None
+        sweep_extreme = None
+        sweep_name = None
+        # Sweep : dépassement d'un extrême asiatique ou CRT puis clôture de réintégration.
+        swept_low = lo < min(asia_low, crt_low) and c > min(asia_low, crt_low) and c > o
+        swept_high = hi > max(asia_high, crt_high) and c < max(asia_high, crt_high) and c < o
+        # Autoriser le sweep de l'un des deux niveaux, sans exiger que les deux soient dépassés.
+        swept_low = swept_low or (lo < asia_low and c > asia_low and c > o) or (lo < crt_low and c > crt_low and c > o)
+        swept_high = swept_high or (hi > asia_high and c < asia_high and c < o) or (hi > crt_high and c < crt_high and c < o)
+
+        # MSS : clôture qui dépasse la structure des bougies précédentes dans le sens du retournement.
+        if swept_low and c > prior_high and trend == "BUY":
+            direction, sweep_level, sweep_extreme, sweep_name = "BUY", min(asia_low, crt_low), lo, "SWEEP_LOW"
+        elif swept_high and c < prior_low and trend == "SELL":
+            direction, sweep_level, sweep_extreme, sweep_name = "SELL", max(asia_high, crt_high), hi, "SWEEP_HIGH"
+        if direction is None:
+            logging.info(f"Aucun setup complet sweep + MSS aligné EMA20 H4 pour {symbol}.")
+            return
+
+        # Zone d'entrée : FVG récent, sinon OB simple (dernière bougie opposée avant impulsion).
+        zone = None
+        if direction == "BUY":
+            for i in range(len(df_m5)-4, max(1, len(df_m5)-14), -1):
+                a, b = df_m5.iloc[i-1], df_m5.iloc[i+1]
+                if float(a["high"]) < float(b["low"]):
+                    zone = {"type": "FVG", "low_band": float(a["high"]), "high_band": float(b["low"])}
+                    break
+            if zone is None:
+                opposites = df_m5.iloc[-8:-2]
+                opposites = opposites[opposites["close"] < opposites["open"]]
+                if not opposites.empty:
+                    ob = opposites.iloc[-1]
+                    zone = {"type": "OB", "low_band": float(ob["low"]), "high_band": float(ob["high"])}
+            sl = min(float(sweep_extreme), float(zone["low_band"]) if zone else float(sweep_extreme)) - max(atr * 0.15, abs(c) * 0.0001)
+            sniper_entry = float(zone["high_band"]) if zone else c
+            risk = sniper_entry - sl
+            target_liquidity = max(asia_high, crt_high, prior_high)
+            tp1 = sniper_entry + risk
+            tp2 = sniper_entry + 2 * risk
+            tp3 = max(sniper_entry + 3.5 * risk, target_liquidity) if target_liquidity > sniper_entry else sniper_entry + 3.5 * risk
+        else:
+            for i in range(len(df_m5)-4, max(1, len(df_m5)-14), -1):
+                a, b = df_m5.iloc[i-1], df_m5.iloc[i+1]
+                if float(a["low"]) > float(b["high"]):
+                    zone = {"type": "FVG", "low_band": float(b["high"]), "high_band": float(a["low"])}
+                    break
+            if zone is None:
+                opposites = df_m5.iloc[-8:-2]
+                opposites = opposites[opposites["close"] > opposites["open"]]
+                if not opposites.empty:
+                    ob = opposites.iloc[-1]
+                    zone = {"type": "OB", "low_band": float(ob["low"]), "high_band": float(ob["high"])}
+            sl = max(float(sweep_extreme), float(zone["high_band"]) if zone else float(sweep_extreme)) + max(atr * 0.15, abs(c) * 0.0001)
+            sniper_entry = float(zone["low_band"]) if zone else c
+            risk = sl - sniper_entry
+            target_liquidity = min(asia_low, crt_low, prior_low)
+            tp1 = sniper_entry - risk
+            tp2 = sniper_entry - 2 * risk
+            tp3 = min(sniper_entry - 3.5 * risk, target_liquidity) if target_liquidity < sniper_entry else sniper_entry - 3.5 * risk
+        if risk <= 0 or risk < atr * 0.15 or risk > atr * 3.0:
+            logging.info(f"Setup rejeté: SL incohérent ou trop éloigné pour {symbol}.")
+            return
+
+        # Premium/Discount : BUY dans la moitié basse du range, SELL dans la moitié haute.
+        dealing_high = max(asia_high, crt_high)
+        dealing_low = min(asia_low, crt_low)
+        midpoint = (dealing_high + dealing_low) / 2
+        if direction == "BUY" and float(zone["high_band"]) > midpoint:
+            logging.info(f"BUY écarté: prix en premium pour {symbol}.")
+            return
+        if direction == "SELL" and float(zone["low_band"]) < midpoint:
+            logging.info(f"SELL écarté: prix en discount pour {symbol}.")
+            return
+
+        # Le FVG/OB doit être identifiable; la surveillance M5 valide ensuite le retest.
+        if not zone:
+            logging.info(f"Aucun FVG/OB exploitable pour {symbol}.")
+            return
+        zone.update({"crt_high": crt_high, "crt_low": crt_low, "asia_high": asia_high, "asia_low": asia_low, "sweep_level": sweep_level, "sweep_extreme": sweep_extreme, "mss_confirmed": True, "ema20_h4": ema20, "trend_h4": trend, "premium_discount_mid": midpoint})
+        indicators = {"ema20_h4": ema20, "trend_h4": trend, "atr14_m5": atr, "crt_high": crt_high, "crt_low": crt_low, "asia_high": asia_high, "asia_low": asia_low, "mss_confirmed": True}
+        candidate_id = create_pending_opportunity(symbol=symbol, direction=direction, pattern=f"SNIPER_{sweep_name}_MSS_{zone['type']}_CRT_EMA20", entry=(float(zone['high_band']) if direction == "BUY" else float(zone['low_band'])), sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, filter_score=3, indicators=indicators, zone=zone, candle_id=candle_id)
+        processed[candle_id] = True
+        save_json(SIGNALS_FILE, processed)
+        logging.info(f"Setup SNIPER {direction} créé: {candidate_id} | CRT + sweep + MSS + {zone['type']} + entrée sur borne FVG/OB + EMA20 H4.")
+    except Exception as e:
+        logging.exception(f"Erreur scan stratégie SNIPER {symbol}: {e}")
+
+
 # ==========================================
 # CONFIRMATION M5
 # ==========================================
@@ -3234,7 +3399,10 @@ def finalize_pending_opportunity(
         ]
     )
 
-    if direction == "BUY":
+    if str(pattern or "").startswith("SNIPER_"):
+        send_telegram_message("🎯 *SIGNAL SNIPER*")
+
+    elif direction == "BUY":
 
         send_telegram_message(
             f"🟢 *SIGNAL ACHAT (BUY) "
@@ -3558,22 +3726,20 @@ def track_active_trades():
 
                         if current_price <= current_sl:
 
+                            close_result = "BE" if status in ("TP1_HIT", "TP2_HIT") and abs(current_sl - entry) <= max(abs(entry) * 0.000001, 0.000001) else "SL"
+                            if close_result == "BE":
+                                record_trade_event(t_id, "BREAK_EVEN_CLOSED", current_price)
                             send_telegram_message(
-                                f"❌ *SL Touché* sur "
-                                f"{symbol} "
-                                f"à {current_price:.2f}.\n"
-                                f"Trade clos."
+                                (f"🟰 *Break-Even atteint* sur {symbol}. Trade clôturé sans perte." if close_result == "BE" else f"❌ *SL Touché* sur {symbol} à {current_price:.2f}.\nTrade clos." )
                             )
 
                             close_trade_in_history(
                                 t_id,
-                                "SL",
+                                close_result,
                                 current_price
                             )
 
-                            trades_to_delete.append(
-                                t_id
-                            )
+                            trades_to_delete.append(t_id)
 
                         elif (
                             current_price >= tp1
@@ -3664,23 +3830,20 @@ def track_active_trades():
 
                         if current_price >= current_sl:
 
+                            close_result = "BE" if status in ("TP1_HIT", "TP2_HIT") and abs(current_sl - entry) <= max(abs(entry) * 0.000001, 0.000001) else "SL"
+                            if close_result == "BE":
+                                record_trade_event(t_id, "BREAK_EVEN_CLOSED", current_price)
                             send_telegram_message(
-                                f"❌ *SL Touché* "
-                                f"(Short) sur "
-                                f"{symbol} "
-                                f"à {current_price:.2f}.\n"
-                                f"Trade clos."
+                                (f"🟰 *Break-Even atteint* sur {symbol}. Trade clôturé sans perte." if close_result == "BE" else f"❌ *SL Touché (Short)* sur {symbol} à {current_price:.2f}.\nTrade clos.")
                             )
 
                             close_trade_in_history(
                                 t_id,
-                                "SL",
+                                close_result,
                                 current_price
                             )
 
-                            trades_to_delete.append(
-                                t_id
-                            )
+                            trades_to_delete.append(t_id)
 
                         elif (
                             current_price <= tp1
@@ -3840,6 +4003,10 @@ def main_scheduler():
                 for symbol in SYMBOLS:
 
                     scan_market_m15(
+                        symbol
+                    )
+
+                    scan_market_sniper(
                         symbol
                     )
 
