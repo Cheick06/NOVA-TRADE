@@ -784,8 +784,52 @@ def utc_now_iso():
     """
     Retourne l'heure UTC actuelle au format ISO.
     """
+    return datetime.now(timezone.utc).isoformat()
 
-    return datetime.utcnow().isoformat()
+
+def get_pip_size(symbol):
+    """Convention de calcul utilisée par les rapports du bot."""
+    symbol = str(symbol or "").upper()
+    if symbol in ("EURUSD", "GBPUSD"):
+        return 0.0001
+    if symbol == "XAUUSD":
+        return 0.01
+    if symbol == "BTCUSD":
+        return 1.0
+    return 0.0001
+
+
+def calculate_pips(symbol, direction, entry_price, exit_price):
+    """Calcule le résultat signé en pips selon la convention de l'actif."""
+    try:
+        entry_price = float(entry_price)
+        exit_price = float(exit_price)
+        pip_size = get_pip_size(symbol)
+        if pip_size <= 0:
+            return 0.0
+        move = exit_price - entry_price
+        if str(direction).upper() == "SELL":
+            move = -move
+        return round(move / pip_size, 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def format_pips(value):
+    value = float(value or 0.0)
+    return f"{value:+.2f} pips"
+
+
+def parse_utc_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
 def ensure_trade_history_record(
     trade_id,
@@ -851,6 +895,8 @@ def ensure_trade_history_record(
         "result": None,
         "closed_at": None,
         "close_price": None,
+        "pip_size": get_pip_size(trade.get("symbol")),
+        "pips_result": None,
         "events": []
     }
 
@@ -882,6 +928,13 @@ def record_trade_event(
 
     if price is not None:
         event_data["price"] = price
+        event_trade = history[trade_id]
+        event_data["pips_from_entry"] = calculate_pips(
+            event_trade.get("symbol"),
+            event_trade.get("direction"),
+            event_trade.get("entry_price"),
+            price
+        )
 
     history[trade_id].setdefault(
         "events",
@@ -917,20 +970,38 @@ def close_trade_in_history(
         )
         return
 
-    history[trade_id]["status"] = "CLOSED"
-    history[trade_id]["result"] = result
-    history[trade_id]["close_price"] = close_price
-    history[trade_id]["closed_at"] = utc_now_iso()
+    closed_trade = history[trade_id]
+    pips_result = calculate_pips(
+        closed_trade.get("symbol"),
+        closed_trade.get("direction"),
+        closed_trade.get("entry_price"),
+        close_price
+    )
+    if result in ("SL", "STOP_LOSS", "BREAK_EVEN", "BE"):
+        if abs(pips_result) < 0.005:
+            result = "BREAK_EVEN"
+            pips_result = 0.0
+        elif pips_result > 0:
+            result = "PROFIT_LOCKED"
+        else:
+            result = "SL"
+    closed_trade["status"] = "CLOSED"
+    closed_trade["result"] = result
+    closed_trade["close_price"] = close_price
+    closed_trade["closed_at"] = utc_now_iso()
+    closed_trade["pip_size"] = get_pip_size(closed_trade.get("symbol"))
+    closed_trade["pips_result"] = pips_result
 
-    history[trade_id].setdefault(
+    closed_trade.setdefault(
         "events",
         []
     )
 
-    history[trade_id]["events"].append({
+    closed_trade["events"].append({
         "event": result,
         "timestamp": utc_now_iso(),
-        "price": close_price
+        "price": close_price,
+        "pips_from_entry": pips_result
     })
 
     save_json(
@@ -968,6 +1039,10 @@ def get_statistics(
         "closed_sl": 0,
         "closed_other": 0,
         "still_active": 0,
+        "total_pips_gained": 0.0,
+        "total_pips_lost": 0.0,
+        "net_pips": 0.0,
+        "pips_by_symbol": {},
         "symbols": {},
         "trades": []
     }
@@ -984,24 +1059,18 @@ def get_statistics(
                 "closed_at"
             )
 
-            created_dt = None
-            closed_dt = None
-
-            if created_at:
-
-                created_dt = (
-                    datetime.fromisoformat(
-                        created_at
-                    )
-                )
-
-            if closed_at:
-
-                closed_dt = (
-                    datetime.fromisoformat(
-                        closed_at
-                    )
-                )
+            created_dt = parse_utc_datetime(created_at)
+            closed_dt = parse_utc_datetime(closed_at)
+            start_bound = (
+                start_datetime.replace(tzinfo=timezone.utc)
+                if start_datetime is not None and start_datetime.tzinfo is None
+                else start_datetime
+            )
+            end_bound = (
+                end_datetime.replace(tzinfo=timezone.utc)
+                if end_datetime is not None and end_datetime.tzinfo is None
+                else end_datetime
+            )
 
             created_in_period = True
 
@@ -1010,7 +1079,7 @@ def get_statistics(
                 created_in_period = (
                     created_dt is not None
                     and
-                    created_dt >= start_datetime
+                    created_dt >= start_bound
                 )
 
             if end_datetime is not None:
@@ -1020,7 +1089,7 @@ def get_statistics(
                     and
                     created_dt is not None
                     and
-                    created_dt < end_datetime
+                    created_dt < end_bound
                 )
 
             closed_in_period = True
@@ -1030,7 +1099,7 @@ def get_statistics(
                 closed_in_period = (
                     closed_dt is not None
                     and
-                    closed_dt >= start_datetime
+                    closed_dt >= start_bound
                 )
 
             if end_datetime is not None:
@@ -1040,7 +1109,7 @@ def get_statistics(
                     and
                     closed_dt is not None
                     and
-                    closed_dt < end_datetime
+                    closed_dt < end_bound
                 )
 
             events = trade.get(
@@ -1103,11 +1172,7 @@ def get_statistics(
 
                     try:
 
-                        event_datetime = (
-                            datetime.fromisoformat(
-                                event_timestamp
-                            )
-                        )
+                        event_datetime = parse_utc_datetime(event_timestamp)
 
                     except Exception:
                         event_datetime = None
@@ -1119,7 +1184,7 @@ def get_statistics(
                     event_in_period = (
                         event_datetime is not None
                         and
-                        event_datetime >= start_datetime
+                        event_datetime >= start_bound
                     )
 
                 if end_datetime is not None:
@@ -1129,7 +1194,7 @@ def get_statistics(
                         and
                         event_datetime is not None
                         and
-                        event_datetime < end_datetime
+                        event_datetime < end_bound
                     )
 
                 if not event_in_period:
@@ -1164,9 +1229,30 @@ def get_statistics(
                 if not closed_in_period:
                     continue
 
-                result = trade.get(
-                    "result"
+                result = trade.get("result")
+                pips_result = trade.get("pips_result")
+                if pips_result is None:
+                    pips_result = calculate_pips(
+                        trade.get("symbol"),
+                        trade.get("direction"),
+                        trade.get("entry_price"),
+                        trade.get("close_price")
+                    )
+                pips_result = float(pips_result or 0.0)
+                if pips_result > 0:
+                    statistics["total_pips_gained"] += pips_result
+                elif pips_result < 0:
+                    statistics["total_pips_lost"] += abs(pips_result)
+                statistics["net_pips"] += pips_result
+                symbol = trade.get("symbol", "INCONNU")
+                symbol_pips = statistics["pips_by_symbol"].setdefault(
+                    symbol, {"gained": 0.0, "lost": 0.0, "net": 0.0}
                 )
+                if pips_result > 0:
+                    symbol_pips["gained"] += pips_result
+                elif pips_result < 0:
+                    symbol_pips["lost"] += abs(pips_result)
+                symbol_pips["net"] += pips_result
 
                 if result == "TP3":
 
@@ -1179,6 +1265,10 @@ def get_statistics(
                     statistics[
                         "closed_sl"
                     ] += 1
+
+                elif result == "BREAK_EVEN":
+
+                    pass
 
                 else:
 
@@ -1208,9 +1298,8 @@ def get_statistics(
                 ),
                 "created_at": created_at,
                 "closed_at": closed_at,
-                "result": trade.get(
-                    "result"
-                )
+                "result": trade.get("result"),
+                "pips_result": trade.get("pips_result")
             })
 
         except Exception as e:
@@ -1224,6 +1313,7 @@ def get_statistics(
         statistics["closed_tp3"]
         + statistics["closed_sl"]
         + statistics["closed_other"]
+        + statistics["break_even"]
     )
 
     if total_closed > 0:
@@ -1259,6 +1349,7 @@ def format_statistics_message(
         statistics["closed_tp3"]
         + statistics["closed_sl"]
         + statistics["closed_other"]
+        + statistics["break_even"]
     )
 
     lines = [
@@ -1282,6 +1373,24 @@ def format_statistics_message(
         f"• Encore actifs : "
         f"{statistics['still_active']}",
         "",
+        "💹 *BILAN EN PIPS (TRADES CLÔTURÉS)*",
+        f"• Pips gagnés : +{statistics['total_pips_gained']:.2f}",
+        f"• Pips perdus : -{statistics['total_pips_lost']:.2f}",
+        f"• Résultat net : {format_pips(statistics['net_pips'])}",
+        "",
+        "📋 *BILAN PAR ACTIF*",
+    ]
+
+    for symbol in SYMBOLS:
+        symbol_result = statistics.get("pips_by_symbol", {}).get(symbol)
+        if symbol_result:
+            lines.append(
+                f"• {symbol} : +{symbol_result['gained']:.2f} / "
+                f"-{symbol_result['lost']:.2f} = {format_pips(symbol_result['net'])}"
+            )
+
+    lines.extend([
+        "",
         "📈 *ÉTAPES ATTEINTES*",
         f"• TP1 : "
         f"{statistics['tp1_hits']}",
@@ -1299,7 +1408,7 @@ def format_statistics_message(
         f"{statistics['tp3_rate']:.1f} %",
         f"• SL : "
         f"{statistics['sl_rate']:.1f} %"
-    ]
+    ])
 
     if statistics["symbols"]:
 
@@ -1348,7 +1457,7 @@ def generate_weekly_report():
     lundi 00:00 -> samedi 00:00.
     """
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     monday = (
         now
@@ -1395,10 +1504,18 @@ def generate_weekly_report():
         f"{(saturday - timedelta(seconds=1)).strftime('%d/%m/%Y')}"
     )
 
+    net_pips = float(statistics.get("net_pips", 0.0))
+    if net_pips > 0:
+        weekly_verdict = f"🏆 BILAN : SEMAINE GAGNANTE de {net_pips:.2f} pips."
+    elif net_pips < 0:
+        weekly_verdict = f"📉 BILAN : SEMAINE PERDANTE de {abs(net_pips):.2f} pips."
+    else:
+        weekly_verdict = "⚖️ BILAN : SEMAINE À L'ÉQUILIBRE (0.00 pip net)."
+
     report_message = (
-        "📊 *RAPPORT HEBDOMADAIRE "
-        "NOVA TRADE*\n\n"
-        f"Période : {period_text}\n\n"
+        "📊 *RAPPORT HEBDOMADAIRE VISION AI*\n\n"
+        f"Période : {period_text} UTC\n\n"
+        f"{weekly_verdict}\n\n"
         + format_statistics_message(
             statistics,
             title="📊 RÉSULTATS DE LA SEMAINE"
@@ -3020,6 +3137,10 @@ def finalize_pending_opportunity(
         f"🥉 TP1 : {price_format.format(tp1)}\n"
         f"🥈 TP2 : {price_format.format(tp2)}\n"
         f"🥇 TP3 : {price_format.format(tp3)}\n"
+        f"📏 Risque initial : {format_pips(calculate_pips(symbol, direction, entry, sl))}\n"
+        f"📏 TP1 distance : {format_pips(calculate_pips(symbol, direction, entry, tp1))}\n"
+        f"📏 TP2 distance : {format_pips(calculate_pips(symbol, direction, entry, tp2))}\n"
+        f"📏 TP3 distance : {format_pips(calculate_pips(symbol, direction, entry, tp3))}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📈 Score du filtre : {filter_score}/4"
     )
@@ -3254,17 +3375,27 @@ def track_active_trades():
 
                         if current_price <= current_sl:
 
+                            stop_pips = calculate_pips(symbol, direction, entry, current_sl)
+                            if abs(stop_pips) < 0.005:
+                                close_label = "Trade clôturé à break-even (BE)"
+                                close_icon = "⚖️"
+                                stop_pips = 0.0
+                            elif stop_pips > 0:
+                                close_label = "Stop de protection bénéficiaire touché"
+                                close_icon = "🔒"
+                            else:
+                                close_label = "Stop-loss touché"
+                                close_icon = "❌"
                             send_telegram_message(
-                                f"❌ *SL Touché* sur "
-                                f"{symbol} "
-                                f"à {current_price:.2f}.\n"
-                                f"Trade clos."
+                                f"{close_icon} *{close_label}* sur {symbol}.\n"
+                                f"Prix de clôture estimé : {current_sl:.5f}.\n"
+                                f"💹 Résultat : {format_pips(stop_pips)}"
                             )
 
                             close_trade_in_history(
                                 t_id,
                                 "SL",
-                                current_price
+                                current_sl
                             )
 
                             trades_to_delete.append(
@@ -3300,6 +3431,7 @@ def track_active_trades():
                                 f"🎯 *TP1 Atteint* "
                                 f"sur {symbol} "
                                 f"({tp1:.2f}) !\n"
+                                f"📈 Distance depuis l'entrée : {format_pips(calculate_pips(symbol, direction, entry, tp1))}\n"
                                 f"🛡️ SL déplacé au "
                                 f"Break-Even."
                             )
@@ -3327,6 +3459,7 @@ def track_active_trades():
                                 f"🎯🎯 *TP2 Atteint* "
                                 f"sur {symbol} "
                                 f"({tp2:.2f}) !\n"
+                                f"📈 Distance depuis l'entrée : {format_pips(calculate_pips(symbol, direction, entry, tp2))}\n"
                                 f"🔒 SL déplacé au "
                                 f"niveau du TP1."
                             )
@@ -3349,6 +3482,7 @@ def track_active_trades():
                                 f"🏆 *TP3 Atteint* "
                                 f"sur {symbol} "
                                 f"({tp3:.2f}).\n"
+                                f"💰 Résultat : {format_pips(calculate_pips(symbol, direction, entry, current_price))}\n"
                                 f"Trade terminé."
                             )
 
@@ -3360,18 +3494,27 @@ def track_active_trades():
 
                         if current_price >= current_sl:
 
+                            stop_pips = calculate_pips(symbol, direction, entry, current_sl)
+                            if abs(stop_pips) < 0.005:
+                                close_label = "Trade clôturé à break-even (BE)"
+                                close_icon = "⚖️"
+                                stop_pips = 0.0
+                            elif stop_pips > 0:
+                                close_label = "Stop de protection bénéficiaire touché"
+                                close_icon = "🔒"
+                            else:
+                                close_label = "Stop-loss touché"
+                                close_icon = "❌"
                             send_telegram_message(
-                                f"❌ *SL Touché* "
-                                f"(Short) sur "
-                                f"{symbol} "
-                                f"à {current_price:.2f}.\n"
-                                f"Trade clos."
+                                f"{close_icon} *{close_label}* sur {symbol}.\n"
+                                f"Prix de clôture estimé : {current_sl:.5f}.\n"
+                                f"💹 Résultat : {format_pips(stop_pips)}"
                             )
 
                             close_trade_in_history(
                                 t_id,
                                 "SL",
-                                current_price
+                                current_sl
                             )
 
                             trades_to_delete.append(
@@ -3408,6 +3551,7 @@ def track_active_trades():
                                 f"(Short) sur "
                                 f"{symbol} "
                                 f"({tp1:.2f}) !\n"
+                                f"📈 Distance depuis l'entrée : {format_pips(calculate_pips(symbol, direction, entry, tp1))}\n"
                                 f"🛡️ SL déplacé au "
                                 f"Break-Even."
                             )
@@ -3436,6 +3580,7 @@ def track_active_trades():
                                 f"(Short) sur "
                                 f"{symbol} "
                                 f"({tp2:.2f}) !\n"
+                                f"📈 Distance depuis l'entrée : {format_pips(calculate_pips(symbol, direction, entry, tp2))}\n"
                                 f"🔒 SL déplacé au "
                                 f"niveau du TP1."
                             )
@@ -3458,6 +3603,7 @@ def track_active_trades():
                                 f"🏆 *TP3 Atteint* "
                                 f"sur {symbol} "
                                 f"({tp3:.2f}).\n"
+                                f"💰 Résultat : {format_pips(calculate_pips(symbol, direction, entry, current_price))}\n"
                                 f"Trade terminé."
                             )
 
