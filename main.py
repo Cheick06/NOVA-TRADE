@@ -2962,118 +2962,72 @@ def finalize_pending_opportunity(
         {}
     )
 
-    trade_id = (
-        f"TRADE_{direction}_"
-        f"{symbol}_"
-        f"{int(time.time())}"
+    sent_at = datetime.now(timezone.utc)
+    signal_id = (
+        f"VISION-{sent_at.strftime('%y%m%d-%H%M%S')}-"
+        f"{symbol}-{int(time.time() * 1000) % 10000:04d}"
     )
+    sent_at_text = sent_at.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    active_trades[
-        trade_id
-    ] = {
+    trade_id = signal_id
 
+    active_trades[trade_id] = {
+        "signal_id": signal_id,
         "symbol": symbol,
-
         "direction": direction,
-
         "entry_price": entry,
-
         "initial_sl": sl,
-
         "current_sl": sl,
-
         "tp1": tp1,
-
         "tp2": tp2,
-
         "tp3": tp3,
-
         "status": "ACTIVE",
-
         "pattern": pattern,
-
+        "setup_type": opportunity.get("setup_type", "REBOND_CLASSIQUE"),
+        "session": opportunity.get("session", "N/A"),
         "filter_score": filter_score,
-
         "indicators": indicators,
-
-        "created_at": (
-            datetime.utcnow()
-            .isoformat()
-        )
+        "created_at": sent_at.isoformat(),
+        "sent_at": sent_at_text,
     }
 
-    save_json(
-        TRADES_FILE,
-        active_trades
-    )
+    save_json(TRADES_FILE, active_trades)
 
     ensure_trade_history_record(
         trade_id,
-        active_trades[
-            trade_id
-        ]
+        active_trades[trade_id]
     )
 
-    if direction == "BUY":
+    is_buy = direction == "BUY"
+    direction_label = "ACHAT (BUY)" if is_buy else "VENTE (SELL)"
+    direction_icon = "🟢" if is_buy else "🔴"
+    price_digits = 2 if symbol in ("BTCUSD", "XAUUSD") else 5
+    price_format = f"{{:.{price_digits}f}}"
 
-        send_telegram_message(
-            f"🟢 *SIGNAL ACHAT (BUY) "
-            f"via BIQUOTE*\n"
-            f"Actif: {symbol}\n"
-            f"Motif: {pattern}\n"
-            f"Timeframes: M15 → M5\n"
-            f"Setup: {opportunity.get('setup_type', 'REBOND_CLASSIQUE')}\n"
-            f"Session: {opportunity.get('session', 'N/A')}\n"
-            f"Filtre: "
-            f"{filter_score}/4\n"
-            f"EMA20/50: "
-            f"{indicators.get('ema20', 0):.5f} / "
-            f"{indicators.get('ema50', 0):.5f}\n"
-            f"RSI14: "
-            f"{indicators.get('rsi14', 0):.2f}\n"
-            f"ATR14: "
-            f"{indicators.get('atr14', 0):.5f}\n"
-            f"ADX14: "
-            f"{indicators.get('adx14', 0):.2f}\n"
-            f"Entrée: {entry:.2f}\n"
-            f"SL Initial: {sl:.2f}\n"
-            f"TP1: "
-            f"{tp1:.2f}\n"
-            f"TP2: "
-            f"{tp2:.2f}\n"
-            f"TP3: "
-            f"{tp3:.2f}"
-        )
+    message = (
+        f"{direction_icon} VISION AI — SIGNAL {direction_label}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Signal : {signal_id}\n"
+        f"🕐 Envoyé le : {sent_at_text}\n"
+        f"💹 Actif : {symbol}\n"
+        f"📊 Timeframes : M15 → M5\n"
+        f"🧭 Setup : {opportunity.get('setup_type', 'REBOND_CLASSIQUE')}\n"
+        f"🔎 Configuration : {pattern}\n"
+        f"🌍 Session : {opportunity.get('session', 'N/A')}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Entrée : {price_format.format(entry)}\n"
+        f"🛑 Stop-loss (SL) : {price_format.format(sl)}\n"
+        f"🥉 TP1 : {price_format.format(tp1)}\n"
+        f"🥈 TP2 : {price_format.format(tp2)}\n"
+        f"🥇 TP3 : {price_format.format(tp3)}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📈 Score du filtre : {filter_score}/4"
+    )
 
-    else:
-
-        send_telegram_message(
-            f"🔴 *SIGNAL VENTE "
-            f"(SHORT) via BIQUOTE*\n"
-            f"Actif: {symbol}\n"
-            f"Motif: {pattern}\n"
-            f"Timeframes: M15 → M5\n"
-            f"Setup: {opportunity.get('setup_type', 'REBOND_CLASSIQUE')}\n"
-            f"Session: {opportunity.get('session', 'N/A')}\n"
-            f"Filtre: "
-            f"{filter_score}/4\n"
-            f"EMA20/50: "
-            f"{indicators.get('ema20', 0):.5f} / "
-            f"{indicators.get('ema50', 0):.5f}\n"
-            f"RSI14: "
-            f"{indicators.get('rsi14', 0):.2f}\n"
-            f"ATR14: "
-            f"{indicators.get('atr14', 0):.5f}\n"
-            f"ADX14: "
-            f"{indicators.get('adx14', 0):.2f}\n"
-            f"Entrée: {entry:.2f}\n"
-            f"SL Initial: {sl:.2f}\n"
-            f"TP1: "
-            f"{tp1:.2f}\n"
-            f"TP2: "
-            f"{tp2:.2f}\n"
-            f"TP3: "
-            f"{tp3:.2f}"
+    sent = send_telegram_message(message)
+    if not sent:
+        logging.error(
+            f"Le signal {signal_id} n'a pas été envoyé sur Telegram."
         )
 
     opportunities.pop(
